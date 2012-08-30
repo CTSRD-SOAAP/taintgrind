@@ -6,8 +6,8 @@
 #define MAX_LEN 256
 #define STACK_SIZE 102400
 
-//int myStringArray_getIndex( struct myStringArray *a, char *string );
-//void myStringArray_push( struct myStringArray *a, char *item );
+Int myStringArray_getIndex( struct myStringArray *a, HChar* string );
+Int myStringArray_push( struct myStringArray *a, HChar* string );
 
 //Stack of strings---------------------------------------
 struct myStringArray{
@@ -61,7 +61,7 @@ struct myStringArray{
 //   }
 };
 
-int myStringArray_getIndex(struct myStringArray *a, char *string){
+Int myStringArray_getIndex(struct myStringArray *a, HChar* string){
    int i;
 
    for( i = 0; i < a->size; i++ ){
@@ -72,15 +72,20 @@ int myStringArray_getIndex(struct myStringArray *a, char *string){
    return -1;
 };
 
-void myStringArray_push( struct myStringArray *a, char *item ){
+Int myStringArray_push( struct myStringArray *a, HChar* string ){
+   Int idx;
    if( a->size >= STACK_SIZE ){
       VG_(printf)("***Error - myStringArray.push: max stack limit reached %d\n", STACK_SIZE);
       //exit(-1);
-      return;
+      return -1;
    }
-
-   VG_(snprintf)( a->m[a->size], MAX_LEN-1, "%s", item );
-   a->size++;   
+   // check if it already exists
+   if ((idx = myStringArray_getIndex(a, string)) == -1) {
+	   VG_(snprintf)( a->m[a->size], MAX_LEN-1, "%s", string );
+	   idx = a->size;
+	   a->size++;
+   }
+   return idx;
 }
 //End Stack of strings---------------------------------------------------
 

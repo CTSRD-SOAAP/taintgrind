@@ -267,14 +267,53 @@ IRSB* TNT_(instrument)( VgCallbackClosure* closure,
 /* Client request handler */
 extern Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret );
 
-extern int in_sandbox;
-extern int shared_fds[];
+/* SOAAP-related data */
+extern Char* client_binary_name;
+#define FNNAME_MAX 100
+
+extern UInt persistent_sandbox_nesting_depth;
+extern UInt ephemeral_sandbox_nesting_depth;
+extern Bool have_created_sandbox;
+
+#define FD_MAX 256
+#define FD_MAX_PATH 256
+#define FD_READ 0x1
+#define FD_WRITE 0x2
+#define FD_STAT 0x4
+
+extern UInt shared_fds[];
+
+#define VAR_MAX 100
+#define VAR_READ 0x1
+#define VAR_WRITE 0x2
+
+enum VariableType { Local = 3, Global = 4 };
+enum VariableLocation { GlobalFromApplication = 5, GlobalFromElsewhere = 6 };
+
+extern struct myStringArray shared_vars;
+extern UInt shared_vars_perms[];
+extern Char* next_shared_variable_to_update;
+
+#define IN_SANDBOX (persistent_sandbox_nesting_depth > 0 || ephemeral_sandbox_nesting_depth > 0)
+
+#define FD_SET_PERMISSION(fd,perm) shared_fds[fd] |= perm
+#define VAR_SET_PERMISSION(var_idx,perm) shared_vars_perms[var_idx] |= perm
+
+#define SYSCALLS_MAX 500
 extern Bool allowed_syscalls[];
-extern int have_forked_sandbox;
-extern int shared_open;
+#define IS_SYSCALL_ALLOWED(no) (allowed_syscalls[no] == True)
+
+extern UInt callgate_nesting_depth;
+#define IN_CALLGATE (nested_callgate_depth > 0)
 
 /* System call array */
 extern const char* syscallnames[];
+
+/* Utility functions */
+extern void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum VariableType* type, enum VariableLocation* loc);
+extern void TNT_(get_fnname)(ThreadId tid, HChar* buf, UInt buf_size);
+extern void TNT_(check_fd_access)(ThreadId tid, UInt fd, Int fd_request);
+extern void TNT_(check_var_access)(ThreadId tid, Char* varname, Int var_request, enum VariableType type, enum VariableLocation var_loc);
 
 #endif /* ndef __TNT_INCLUDE_H */
 

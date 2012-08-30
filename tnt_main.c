@@ -32,7 +32,7 @@
 
 #include "pub_tool_vki.h"           // keeps libcproc.h happy
 #include "pub_tool_aspacemgr.h"     // VG_(am_shadow_alloc)
-#include "pub_tool_debuginfo.h"     // VG_(get_fnname_w_offset)
+#include "pub_tool_debuginfo.h"     // VG_(get_fnname_w_offset), VG_(get_fnname)
 #include "pub_tool_hashtable.h"     // For tnt_include.h, VgHashtable
 #include "pub_tool_libcassert.h"    // tl_assert
 #include "pub_tool_libcbase.h"      // VG_STREQN
@@ -45,6 +45,7 @@
 #include "pub_tool_oset.h"          // OSet operations
 #include "pub_tool_threadstate.h"   // VG_(get_running_tid)
 #include "pub_tool_xarray.h"		// VG_(*XA)
+#include "pub_tool_stacktrace.h"	// VG_(get_and_pp_StackTrace)
 
 #include "tnt_include.h"
 #include "tnt_strings.h"
@@ -2210,9 +2211,12 @@ Int ctoi( Char c ){
    case 'f':
    case 'F':
       return 0xf;
-   default:
+   default: {
       tl_assert(0);
+      break;
    }
+   }
+   return -1; // unreachable
 }
 
 Int atoi( Char *s ){
@@ -2605,19 +2609,26 @@ int reg_i[REG_I_MAX];
 struct myStringArray lvar_s;
 int lvar_i[STACK_SIZE];
 
-enum VariableType { Local = 3, Global = 4 };
-enum VariableLocation { GlobalFromApplication = 5, GlobalFromElsewhere = 6 };
+////////////////////////////////
+// Start of SOAAP-related data
+////////////////////////////////
+Char* client_binary_name = NULL;
 
-#define FD_MAX 100
-int shared_fds[FD_MAX];
-int in_sandbox = 0;
-int have_forked_sandbox = 0;
+UInt shared_fds[FD_MAX];
+UInt persistent_sandbox_nesting_depth = 0;
+UInt ephemeral_sandbox_nesting_depth = 0;
+Bool have_created_sandbox = False;
+
 struct myStringArray shared_vars;
-Char* binary_name = NULL;
+UInt shared_vars_perms[VAR_MAX];
 Char* next_shared_variable_to_update = NULL;
-#define SYSCALLS_MAX 100
+
 Bool allowed_syscalls[SYSCALLS_MAX];
-int shared_open = 0;
+
+UInt callgate_nesting_depth = 0;
+////////////////////////////////
+// End of SOAAP-related data
+////////////////////////////////
 
 Int get_and_check_reg( Char *reg ){
 
@@ -2651,8 +2662,7 @@ void TNT_(helperc_0_tainted_enc32) (
    UInt taint ) {
 
    UInt  pc; 
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
    Char  aTmp[128];
    UInt  enc[4] = { enc0, enc1, enc2, enc3 };
 
@@ -2667,7 +2677,7 @@ void TNT_(helperc_0_tainted_enc32) (
       if((TNT_(clo_tainted_ins_only) && taint) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
 
          decode_string( enc, aTmp );
          post_decode_string( aTmp );
@@ -2789,8 +2799,7 @@ void TNT_(helperc_0_tainted_enc64) (
    ULong taint ) {
 
    ULong  pc; 
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
    Char  aTmp[128];
    UInt  enc[4] = { (UInt)(enc0 >> 32), (UInt)(enc0 & 0xffffffff),
                     (UInt)(enc1 >> 32), (UInt)(enc1 & 0xffffffff) };
@@ -2806,7 +2815,7 @@ void TNT_(helperc_0_tainted_enc64) (
       if((TNT_(clo_tainted_ins_only) && taint) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
 
          decode_string( enc, aTmp );
          post_decode_string( aTmp );
@@ -2933,64 +2942,31 @@ void TNT_(helperc_1_tainted_enc32) (
    UInt taint1, 
    UInt taint2 ) {
 
-   UInt  pc; 
-   Char  fnname[300];
-   Int   n_fnname = 300;
    Char  aTmp[128];
    UInt  enc[4] = { enc0, enc1, enc2/*0xffffffff*/, 0xffffffff };
 
    ThreadId tid = VG_(get_running_tid());
 
-   pc = VG_(get_IP)( tid );
-   VG_(describe_IP) ( pc, fnname, n_fnname );
-
    decode_string( enc, aTmp );
    //VG_(printf)("decoded string %s\n", aTmp);
    post_decode_string( aTmp );
 
-   Char objname[256];
-   VG_(memset)( objname, 0, 255 );
+   Char varname[256];
+   VG_(memset)( varname, 0, 255 );
+
+   HChar fnname[FNNAME_MAX];
+   TNT_(get_fnname)(tid, fnname, FNNAME_MAX);
 
    enum VariableType type = 0;
-
-   char* just_fnname = VG_(strstr)(fnname, ":");
-   just_fnname += 2;
-
    enum VariableLocation var_loc;
+
    if( VG_(strstr)( aTmp, " LD " ) != NULL) {
-	   TNT_(describe_data)(value2, objname, 255, &type, &var_loc);
-	   if (in_sandbox && type == Global && var_loc == GlobalFromApplication) {
-		   if (myStringArray_getIndex(&shared_vars, objname) == -1) {
-			   VG_(printf)("*** Thread %d read global variable \"%s\" in method %s, but it is not allowed to. ***\n", tid, objname, just_fnname);
-			   VG_(get_and_pp_StackTrace)(tid, STACK_TRACE_SIZE);
-			   VG_(printf)("\n");
-		   }
-	   }
+	   TNT_(describe_data)(value2, varname, 255, &type, &var_loc);
+	   TNT_(check_var_access)(tid, varname, VAR_READ, type, var_loc);
    }
    else if( VG_(strstr)( aTmp, " ST " ) != NULL) {
-	   TNT_(describe_data)(value1, objname, 255, &type, &var_loc);
-	   if (type == Global && var_loc == GlobalFromApplication) {
-		   if (in_sandbox) {
-			   if (myStringArray_getIndex(&shared_vars, objname) == -1) {
-				   VG_(printf)("*** Thread %d wrote to global variable %s in method %s, but it is not allowed to. ***\n", tid, objname, just_fnname);
-				   VG_(get_and_pp_StackTrace)(tid, STACK_TRACE_SIZE);
-				   VG_(printf)("\n");
-			   }
-			   else if (next_shared_variable_to_update == NULL || VG_(strcmp)(next_shared_variable_to_update, objname) != 0) {
-				   VG_(printf)("*** Thread %d is allowed to write to global variable %s in method %s, but you have not explicitly declared this. ***\n", tid, objname, just_fnname);
-				   VG_(get_and_pp_StackTrace)(tid, STACK_TRACE_SIZE);
-				   VG_(printf)("\n");
-			   }
-		   }
-		   else if (have_forked_sandbox) {
-			   if (myStringArray_getIndex(&shared_vars, objname) >= 0 && (next_shared_variable_to_update == NULL || VG_(strcmp)(next_shared_variable_to_update, objname) != 0)) {
-				   VG_(printf)("*** Global variable %s is being written to in method %s after a sandbox has been forked and so the sandbox will not see this new value. Please wrap it with a macro. ***\n", objname, just_fnname);
-				   VG_(get_and_pp_StackTrace)(tid, STACK_TRACE_SIZE);
-				   VG_(printf)("\n");
-			   }
-		   }
-		   next_shared_variable_to_update = NULL;
-	   }
+	   TNT_(describe_data)(value1, varname, 255, &type, &var_loc);
+	   TNT_(check_var_access)(tid, varname, VAR_WRITE, type, var_loc);
    }
 
    // if we are in sandbox mode, then check if the sandbox is allowed to
@@ -3041,8 +3017,8 @@ void TNT_(helperc_1_tainted_enc32) (
 //             TNT_(describe_data)(value2, objname, 255, &type);
 
             // Check if it hasn't been seen before
-            if( myStringArray_getIndex( &lvar_s, objname ) == -1 ){
-               myStringArray_push( &lvar_s, objname );
+            if( myStringArray_getIndex( &lvar_s, varname ) == -1 ){
+               myStringArray_push( &lvar_s, varname );
             }
 
             Char *pTmp, *pEquals;
@@ -3061,7 +3037,7 @@ void TNT_(helperc_1_tainted_enc32) (
             tvar_i[tmpnum]++;
 
 //            VG_(printf)( "t%s.%d <- %s", tmp, tvar_i[tmpnum], objname );
-            VG_(printf)( "(%d) t%s.%d <- %s.%d", type, tmp, tvar_i[tmpnum], objname, lvar_i[ myStringArray_getIndex( &lvar_s, objname ) ] );
+            VG_(printf)( "(%d) t%s.%d <- %s.%d", type, tmp, tvar_i[tmpnum], varname, lvar_i[ myStringArray_getIndex( &lvar_s, varname ) ] );
 
             // Pointer tainting
             Char *pTmp2 = VG_(strstr)( pTmp + 1, " t" );
@@ -3103,10 +3079,10 @@ void TNT_(helperc_1_tainted_enc32) (
 //            TNT_(describe_data)(value1, objname, 255, &type);
 
             // Check if it hasn't been seen before
-            if( myStringArray_getIndex( &lvar_s, objname ) == -1 ){
-               myStringArray_push( &lvar_s, objname );
+            if( myStringArray_getIndex( &lvar_s, varname ) == -1 ){
+               myStringArray_push( &lvar_s, varname );
             }
-            lvar_i[ myStringArray_getIndex( &lvar_s, objname ) ]++;
+            lvar_i[ myStringArray_getIndex( &lvar_s, varname ) ]++;
 
             Char *pEquals, *pTmp, *pSpace;
             Char tmp[16];
@@ -3126,7 +3102,7 @@ void TNT_(helperc_1_tainted_enc32) (
                // Get index
                Int tmpnum = get_and_check_tvar( tmp );
 
-               VG_(printf)( "(%d) %s.%d <- t%s.%d", type, objname, lvar_i[ myStringArray_getIndex( &lvar_s, objname ) ], tmp, tvar_i[tmpnum] );
+               VG_(printf)( "(%d) %s.%d <- t%s.%d", type, varname, lvar_i[ myStringArray_getIndex( &lvar_s, varname ) ], tmp, tvar_i[tmpnum] );
 
                // Pointer tainting
                Char *pTmp2 = VG_(strstr)( aTmp, " t" );
@@ -3160,7 +3136,7 @@ void TNT_(helperc_1_tainted_enc32) (
             }else{
             // 0x19006 ST t80 = 0xff
             //               ^--pEquals
-               VG_(printf)( "%s.%d", objname, lvar_i[ myStringArray_getIndex( &lvar_s, objname ) ] );
+               VG_(printf)( "%s.%d", varname, lvar_i[ myStringArray_getIndex( &lvar_s, varname ) ] );
             }
 
          }else /*if( taint1 && taint2 )*/{
@@ -3217,8 +3193,7 @@ void TNT_(helperc_1_tainted_enc64) (
    ULong taint2 ) {
 
    ULong  pc; 
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
    Char  aTmp[128];
    UInt  enc[4] = { (UInt)(enc0 >> 32), (UInt)(enc0 & 0xffffffff),
                     (UInt)(enc1 >> 32), (UInt)(enc1 & 0xffffffff) };
@@ -3245,7 +3220,7 @@ void TNT_(helperc_1_tainted_enc64) (
       if((TNT_(clo_tainted_ins_only) && (taint1 || taint2)) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
 
          decode_string( enc, aTmp );
          post_decode_string( aTmp );
@@ -3263,7 +3238,8 @@ void TNT_(helperc_1_tainted_enc64) (
             VG_(memset)( objname, 0, 255 );
 //            VG_(get_datasym_and_offset)( value2, objname, 255, &pdt );
             enum VariableType type;
-            TNT_(describe_data)(value2, objname, 255, &type);
+            enum VariableLocation loc;
+            TNT_(describe_data)(value2, objname, 255, &type, &loc);
 
 //            if( objname[0] == '\0' ){
 //               VG_(sprintf)( objname, "%lx_unknownobj", (long unsigned int) value2 );
@@ -3311,7 +3287,8 @@ void TNT_(helperc_1_tainted_enc64) (
             VG_(memset)( objname, 0, 255 );
 //            VG_(get_datasym_and_offset)( value1, objname, 255, &pdt );
             enum VariableType type;
-            TNT_(describe_data)(value1, objname, 255, &type);
+            enum VariableLocation loc;
+            TNT_(describe_data)(value1, objname, 255, &type, &loc);
 
 //            if( objname[0] == '\0' ){
 //               VG_(sprintf)( objname, "%lx_unknownobj", (long unsigned int)  value1 );
@@ -3412,8 +3389,7 @@ void TNT_(helperc_0_tainted) (
    UInt taint ) {
 
    UInt  pc; 
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3425,7 +3401,7 @@ void TNT_(helperc_0_tainted) (
       if((TNT_(clo_tainted_ins_only) && taint) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
          VG_(printf)("%s | %s | 0x%x | 0x%x | ", fnname, str, value, taint );
 
          // Information flow
@@ -3483,8 +3459,7 @@ void TNT_(helperc_1_tainted) (
    UInt taint2 ) {
 
    UInt  pc; 
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3496,7 +3471,7 @@ void TNT_(helperc_1_tainted) (
       if((TNT_(clo_tainted_ins_only) && (taint1 || taint2)) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
          VG_(printf)("%s | %s | 0x%x 0x%x | 0x%x 0x%x\n", 
             fnname, str, value, arg1, taint1, taint2 );
 //         VG_(message_flush) ( );
@@ -3515,8 +3490,7 @@ void TNT_(helperc_2_tainted) (
    UInt taint3 ) {
 
    UInt  pc;
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3528,7 +3502,7 @@ void TNT_(helperc_2_tainted) (
       if((TNT_(clo_tainted_ins_only) && (taint1 || taint2 || taint3) ) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
          VG_(printf)("%s | %s | 0x%x 0x%x 0x%x | 0x%x 0x%x 0x%x | ", 
             fnname, str, value, arg1, arg2, 
             taint1, taint2, taint3 );
@@ -3584,8 +3558,7 @@ void TNT_(helperc_3_tainted) (
    UInt taint ) {
 
    UInt  pc;
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3597,7 +3570,7 @@ void TNT_(helperc_3_tainted) (
       if((TNT_(clo_tainted_ins_only) && taint) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
          VG_(printf)("%s | %s | 0x%x 0x%x 0x%x 0x%x | 0x%x\n", 
             fnname, str, value, arg1, arg2, arg3, taint );
 //         VG_(message_flush) ( );
@@ -3616,8 +3589,7 @@ void TNT_(helperc_4_tainted) (
    UInt taint ) {
 
    UInt  pc;
-   Char  fnname[300];
-   Int   n_fnname = 300;
+   Char  fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3629,7 +3601,7 @@ void TNT_(helperc_4_tainted) (
       if((TNT_(clo_tainted_ins_only) && taint) ||
           !TNT_(clo_tainted_ins_only)){
          pc = VG_(get_IP)( VG_(get_running_tid)() );
-         VG_(describe_IP) ( pc, fnname, n_fnname );
+         VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
          VG_(printf)("%s | %s | 0x%x 0x%x 0x%x 0x%x 0x%x | 0x%x\n", 
             fnname, str, value, arg1, arg2, arg3, arg4, taint );
 //         VG_(message_flush) ( );
@@ -3759,8 +3731,8 @@ void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum Variabl
 		// it's a global variable
 		*type = Global;
 
-		if (have_forked_sandbox || in_sandbox) {
-			tl_assert(binary_name != NULL);
+		if (have_created_sandbox || IN_SANDBOX) {
+			tl_assert(client_binary_name != NULL);
 //
 //			// let's determine it's location:
 			// It is external from this application if:
@@ -3770,7 +3742,7 @@ void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum Variabl
 			UInt pc = VG_(get_IP)(VG_(get_running_tid)());
 			Char binarynamebuf[1024];
 			VG_(get_objname)(pc, binarynamebuf, 1024);
-			*loc = (VG_(strcmp)(binarynamebuf, binary_name) == 0 && VG_(strstr)(varnamebuf, "\@\@") == NULL) ? GlobalFromApplication : GlobalFromElsewhere;
+			*loc = (VG_(strcmp)(binarynamebuf, client_binary_name) == 0 && VG_(strstr)(varnamebuf, "@@") == NULL) ? GlobalFromApplication : GlobalFromElsewhere;
 		}
 	}
 }
@@ -3927,54 +3899,78 @@ void tnt_post_syscall(ThreadId tid, UInt syscallno,
 
 Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret ) {
 	switch (arg[0]) {
-		case VG_USERREQ__TAINTGRIND_ENTERSANDBOX: {
-			in_sandbox = 1;
+		case VG_USERREQ__TAINTGRIND_ENTER_PERSISTENT_SANDBOX: {
+			persistent_sandbox_nesting_depth++;
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_EXITSANDBOX: {
-			in_sandbox = 0;
+		case VG_USERREQ__TAINTGRIND_EXIT_PERSISTENT_SANDBOX: {
+			persistent_sandbox_nesting_depth--;
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_FORKSANDBOX: {
-			have_forked_sandbox = 1;
+		case VG_USERREQ__TAINTGRIND_ENTER_EPHEMERAL_SANDBOX: {
+			ephemeral_sandbox_nesting_depth++;
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_SHAREDFD: {
+		case VG_USERREQ__TAINTGRIND_EXIT_EPHEMERAL_SANDBOX: {
+			ephemeral_sandbox_nesting_depth--;
+			break;
+		}
+		case VG_USERREQ__TAINTGRIND_CREATE_SANDBOX: {
+			have_created_sandbox = 1;
+			break;
+		}
+		case VG_USERREQ__TAINTGRIND_READ_SHARED_FD: {
 			Int fd = arg[1];
 			if (fd >= 0) {
-				shared_fds[fd] = fd;
+				FD_SET_PERMISSION(fd, FD_READ);
 			}
-			*ret = fd;
-			break;
-
-		}
-		case VG_USERREQ__TAINTGRIND_SHAREDOPEN: {
-			shared_open = 1;
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_SHAREDVAR: {
-			Char* var = arg[1];
-			myStringArray_push(&shared_vars, var);
+		case VG_USERREQ__TAINTGRIND_WRITE_SHARED_FD: {
+			Int fd = arg[1];
+			if (fd >= 0) {
+				FD_SET_PERMISSION(fd, FD_WRITE);
+			}
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_UPDATESHAREDVAR: {
+		case VG_USERREQ__TAINTGRIND_READ_SHARED_VAR: {
+			Char* var = (Char*)arg[1];
+			Int var_idx = myStringArray_push(&shared_vars, var);
+			VAR_SET_PERMISSION(var_idx, VAR_READ);
+			break;
+		}
+		case VG_USERREQ__TAINTGRIND_WRITE_SHARED_VAR: {
+			Char* var = (Char*)arg[1];
+			Int var_idx = myStringArray_push(&shared_vars, var);
+			VAR_SET_PERMISSION(var_idx, VAR_WRITE);
+			break;
+		}
+		case VG_USERREQ__TAINTGRIND_UPDATE_SHARED_VAR: {
 			// record next shared var to be updated so that we can
 			// check that the user has annotated a global variable write
-			next_shared_variable_to_update = arg[1];
+			next_shared_variable_to_update = (Char*)arg[1];
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_ALLOWSYSCALL: {
+		case VG_USERREQ__TAINTGRIND_ALLOW_SYSCALL: {
 			int syscallno = arg[1];
 			allowed_syscalls[syscallno] = True;
 			break;
 		}
+		case VG_USERREQ__TAINTGRIND_ENTER_CALLGATE: {
+			callgate_nesting_depth++;
+			break;
+		}
+		case VG_USERREQ__TAINTGRIND_EXIT_CALLGATE: {
+			callgate_nesting_depth--;
+			break;
+		}
 	}
 	// initialise binary_name on first client request
-	if (binary_name == NULL) {
+	if (client_binary_name == NULL) {
 		UInt pc = VG_(get_IP)(tid);
-		binary_name = (Char*)VG_(malloc)("binary_name",sizeof(Char)*1024);
-		VG_(get_objname)(pc, binary_name, 1024);
-		VG_(printf)("binary_name: %s\n", binary_name);
+		client_binary_name = (Char*)VG_(malloc)("client_binary_name",sizeof(Char)*1024);
+		VG_(get_objname)(pc, client_binary_name, 1024);
+		VG_(printf)("client_binary_name: %s\n", client_binary_name);
 	}
 	return True;
 }
@@ -4113,6 +4109,8 @@ static void tnt_pre_clo_init(void)
 
    init_shadow_memory();
 
+   init_soaap_data();
+
    VG_(needs_command_line_options)(tnt_process_cmd_line_options,
                                    tnt_print_usage,
                                    tnt_print_debug_usage);
@@ -4143,6 +4141,75 @@ static void tnt_pre_clo_init(void)
 }
 
 VG_DETERMINE_INTERFACE_VERSION(tnt_pre_clo_init)
+
+void TNT_(check_var_access)(ThreadId tid, Char* varname, Int var_request, enum VariableType type, enum VariableLocation var_loc) {
+	if (type == Global && var_loc == GlobalFromApplication) {
+		Char  fnname[FNNAME_MAX];
+		TNT_(get_fnname)(tid, fnname, FNNAME_MAX);
+		Int var_idx = myStringArray_getIndex(&shared_vars, varname);
+		// first check if this access is allowed
+		Bool allowed = var_idx != -1 && (shared_vars_perms[var_idx] & var_request);
+		if (IN_SANDBOX && !allowed) {
+			Char* access_str;
+			switch (var_request) {
+				case VAR_READ: {
+					access_str = "read";
+					break;
+				}
+				case VAR_WRITE: {
+					access_str = "wrote to";
+					break;
+				}
+				default: {
+					tl_assert(0);
+					break;
+				}
+			}
+			VG_(printf)("*** Sandbox %s global variable \"%s\" in method %s, but it is not allowed to. ***\n", access_str, varname, fnname);
+			VG_(get_and_pp_StackTrace)(tid, STACK_TRACE_SIZE);
+			VG_(printf)("\n");
+		}
+		// check for unnannotated writes to global vars both inside and outside
+		// sandboxes
+		if (var_request == VAR_WRITE) {
+			if (next_shared_variable_to_update == NULL || VG_(strcmp)(next_shared_variable_to_update, varname) != 0) {
+				if (IN_SANDBOX) {
+					if (allowed) {
+						VG_(printf)("*** Sandbox is allowed to write to global variable \"%s\" in method %s, but you have not explicitly declared this. ***\n", varname, fnname);
+						VG_(get_and_pp_StackTrace)(tid, STACK_TRACE_SIZE);
+						VG_(printf)("\n");
+					}
+				}
+				else if (have_created_sandbox) {
+					// only output this error if the sandbox is allowed at least read access
+					Bool allowed_read = var_idx != -1 && (shared_vars_perms[var_idx] & VAR_READ);
+					if (allowed_read) {
+						VG_(printf)("*** Global variable \"%s\" is being written to in method %s after a sandbox has been created and so the sandbox will not see this new value. ***\n", varname, fnname);
+						VG_(get_and_pp_StackTrace)(tid, STACK_TRACE_SIZE);
+						VG_(printf)("\n");
+					}
+				}
+			}
+			else {
+				next_shared_variable_to_update = NULL;
+			}
+		}
+
+	}
+}
+
+void init_soaap_data() {
+	persistent_sandbox_nesting_depth = 0;
+	ephemeral_sandbox_nesting_depth = 0;
+	have_created_sandbox = False;
+
+	VG_(memset)(shared_vars_perms, 0, sizeof(Int)*VAR_MAX);
+	VG_(memset)(shared_fds, 0, sizeof(Int)*FD_MAX);
+	VG_(memset)(allowed_syscalls, 0, sizeof(Bool)*SYSCALLS_MAX);
+
+	next_shared_variable_to_update = NULL;
+	client_binary_name = NULL;
+}
 
 /*--------------------------------------------------------------------*/
 /*--- end                                                          ---*/
