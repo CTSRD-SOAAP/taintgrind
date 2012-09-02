@@ -3919,30 +3919,19 @@ Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret ) {
 			have_created_sandbox = 1;
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_READ_SHARED_FD: {
+		case VG_USERREQ__TAINTGRIND_SHARED_FD: {
 			Int fd = arg[1];
+			Int perm = arg[2];
 			if (fd >= 0) {
-				FD_SET_PERMISSION(fd, FD_READ);
+				FD_SET_PERMISSION(fd, perm);
 			}
 			break;
 		}
-		case VG_USERREQ__TAINTGRIND_WRITE_SHARED_FD: {
-			Int fd = arg[1];
-			if (fd >= 0) {
-				FD_SET_PERMISSION(fd, FD_WRITE);
-			}
-			break;
-		}
-		case VG_USERREQ__TAINTGRIND_READ_SHARED_VAR: {
+		case VG_USERREQ__TAINTGRIND_SHARED_VAR: {
 			Char* var = (Char*)arg[1];
+			Int perm = arg[2];
 			Int var_idx = myStringArray_push(&shared_vars, var);
-			VAR_SET_PERMISSION(var_idx, VAR_READ);
-			break;
-		}
-		case VG_USERREQ__TAINTGRIND_WRITE_SHARED_VAR: {
-			Char* var = (Char*)arg[1];
-			Int var_idx = myStringArray_push(&shared_vars, var);
-			VAR_SET_PERMISSION(var_idx, VAR_WRITE);
+			VAR_SET_PERMISSION(var_idx, perm);
 			break;
 		}
 		case VG_USERREQ__TAINTGRIND_UPDATE_SHARED_VAR: {
