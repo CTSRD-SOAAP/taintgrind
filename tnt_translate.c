@@ -801,9 +801,13 @@ static void setHelperAnns ( MCEnv* mce, IRDirty* di ) { //970
    di->fxState[0].fx     = Ifx_Read;
    di->fxState[0].offset = mce->layout->offset_SP;
    di->fxState[0].size   = mce->layout->sizeof_SP;
+   di->fxState[0].nRepeats  = 0;
+   di->fxState[0].repeatLen = 0;
    di->fxState[1].fx     = Ifx_Read;
    di->fxState[1].offset = mce->layout->offset_IP;
    di->fxState[1].size   = mce->layout->sizeof_IP;
+   di->fxState[1].nRepeats  = 0;
+   di->fxState[1].repeatLen = 0;
 }
 
 // Taintgrind: Forward decls
@@ -980,7 +984,7 @@ static Bool isAlwaysDefd ( MCEnv* mce, Int offset, Int size ) //1159
 */
 static
 void do_shadow_PUT ( MCEnv* mce,  Int offset,  //1191
-                     IRAtom* atom, IRAtom* vatom )
+                     IRAtom* atom, IRAtom* vatom, IRExpr *guard )
 {
    IRType ty;
    IRDirty* di2;
@@ -1011,6 +1015,16 @@ void do_shadow_PUT ( MCEnv* mce,  Int offset,  //1191
       /* complainIfTainted(mce, atom); */
 //   } else {
       /* Do a plain shadow Put. */
+      if (guard) {
+         /* If the guard expression evaluates to false we simply Put the value
+            that is already stored in the guest state slot */
+         IRAtom *cond, *iffalse;
+
+         cond    = assignNew('V', mce, Ity_I8, unop(Iop_1Uto8, guard));
+         iffalse = assignNew('V', mce, ty,
+                             IRExpr_Get(offset + mce->layout->total_sizeB, ty));
+         vatom   = assignNew('V', mce, ty, IRExpr_Mux0X(cond, iffalse, vatom));
+      }
       stmt( 'V', mce, IRStmt_Put( offset + mce->layout->total_sizeB, vatom ) );
 
       // Taintgrind: include this check only if we're not tracking critical ins
@@ -1025,13 +1039,17 @@ void do_shadow_PUT ( MCEnv* mce,  Int offset,  //1191
    given PUTI (passed in in pieces).
 */
 static
-void do_shadow_PUTI ( MCEnv* mce, //1228
-                      IRRegArray* descr,
-                      IRAtom* ix, Int bias, IRAtom* atom )
+void do_shadow_PUTI ( MCEnv* mce, IRPutI *puti ) // 1344
+//                      IRRegArray* descr,
+//                      IRAtom* ix, Int bias, IRAtom* atom )
 {
    IRAtom* vatom;
    IRType  ty, tyS;
    Int     arrSize;
+   IRRegArray* descr = puti->descr;
+   IRAtom*     ix    = puti->ix;
+   Int         bias  = puti->bias;
+   IRAtom*     atom  = puti->data;
    IRDirty* di2;
 
    // Don't do shadow PUTIs if we're not doing undefined value checking.
@@ -1065,7 +1083,8 @@ void do_shadow_PUTI ( MCEnv* mce, //1228
       IRRegArray* new_descr
          = mkIRRegArray( descr->base + mce->layout->total_sizeB,
                          tyS, descr->nElems);
-      stmt( 'V', mce, IRStmt_PutI( new_descr, ix, bias, vatom ));
+      IRPutI* new_puti = mkIRPutI( new_descr, ix, bias, vatom );
+      stmt( 'V', mce, IRStmt_PutI( new_puti ));
 
 //   }
 }
@@ -2788,16 +2807,17 @@ IRExpr* expr2vbits ( MCEnv* mce, IRExpr* e ) //2909
       case Iex_Qop:
          return expr2vbits_Qop(
                    mce,
-                   e->Iex.Qop.op,
-                   e->Iex.Qop.arg1, e->Iex.Qop.arg2,
-                   e->Iex.Qop.arg3, e->Iex.Qop.arg4
+                   e->Iex.Qop.details->op,
+                   e->Iex.Qop.details->arg1, e->Iex.Qop.details->arg2,
+                   e->Iex.Qop.details->arg3, e->Iex.Qop.details->arg4
                 );
 
      case Iex_Triop:
         return expr2vbits_Triop(
                    mce,
-                   e->Iex.Triop.op,
-                   e->Iex.Triop.arg1, e->Iex.Triop.arg2, e->Iex.Triop.arg3
+                   e->Iex.Triop.details->op,
+                   e->Iex.Triop.details->arg1, e->Iex.Triop.details->arg2,
+                   e->Iex.Triop.details->arg3
                 );
 
       case Iex_Binop:
@@ -3131,7 +3151,7 @@ static IRType szToITy ( Int n )
 static
 void do_shadow_Dirty ( MCEnv* mce, IRDirty* d ) // 3224
 {
-   Int       i, n, toDo, gSz, gOff;
+   Int       i, k, n, toDo, gSz, gOff;
    IRAtom    *src, *here, *curr;
    IRType    tySrc, tyDst;
    IRTemp    dst;
@@ -3174,35 +3194,83 @@ void do_shadow_Dirty ( MCEnv* mce, IRDirty* d ) // 3224
       if (d->fxState[i].fx == Ifx_Write)
          continue;
 
-      /* Ignore any sections marked as 'always defined'. */
-      if (isAlwaysDefd(mce, d->fxState[i].offset, d->fxState[i].size )) {
-         if (0)
-         VG_(printf)("memcheck: Dirty gst: ignored off %d, sz %d\n",
-                     d->fxState[i].offset, d->fxState[i].size );
-         continue;
-      }
+      /* Enumerate the described state segments */
+      for (k = 0; k < 1 + d->fxState[i].nRepeats; k++) {
+         gOff = d->fxState[i].offset + k * d->fxState[i].repeatLen;
+         gSz  = d->fxState[i].size;
 
-      /* This state element is read or modified.  So we need to
-         consider it.  If larger than 8 bytes, deal with it in 8-byte
-         chunks. */
-      gSz  = d->fxState[i].size;
-      gOff = d->fxState[i].offset;
-      tl_assert(gSz > 0);
-      while (True) {
-         if (gSz == 0) break;
-         n = gSz <= 8 ? gSz : 8;
-         /* update 'curr' with UifU of the state slice
-            gOff .. gOff+n-1 */
-         tySrc = szToITy( n );
-         src   = assignNew( 'V', mce, tySrc,
-                                 shadow_GET(mce, gOff, tySrc ) );
-         here = mkPCastTo( mce, Ity_I32, src );
-         curr = mkUifU32(mce, here, curr);
-         gSz -= n;
-         gOff += n;
-      }
+         /* Ignore any sections marked as 'always defined'. */
+         if (isAlwaysDefd(mce, gOff, gSz)) {
+            if (0)
+            VG_(printf)("tnt_translate: Dirty gst: ignored off %d, sz %d\n",
+                        gOff, gSz);
+            continue;
+         }
 
+         /* This state element is read or modified.  So we need to
+            consider it.  If larger than 8 bytes, deal with it in
+            8-byte chunks. */
+         while (True) {
+            tl_assert(gSz >= 0);
+            if (gSz == 0) break;
+            n = gSz <= 8 ? gSz : 8;
+            /* update 'curr' with UifU of the state slice 
+               gOff .. gOff+n-1 */
+            tySrc = szToITy( n );
+
+            /* Observe the guard expression. If it is false use an
+               all-bits-defined bit pattern */
+            IRAtom *cond, *iffalse, *iftrue;
+
+            cond    = assignNew('V', mce, Ity_I8, unop(Iop_1Uto8, d->guard));
+            iftrue  = assignNew('V', mce, tySrc, shadow_GET(mce, gOff, tySrc));
+            iffalse = assignNew('V', mce, tySrc, definedOfType(tySrc));
+            src     = assignNew('V', mce, tySrc,
+                                IRExpr_Mux0X(cond, iffalse, iftrue));
+
+            here = mkPCastTo( mce, Ity_I32, src );
+            curr = mkUifU32(mce, here, curr);
+            gSz -= n;
+            gOff += n;
+         }
+      }
    }
+
+//   /* Inputs: guest state that we read. */
+//   for (i = 0; i < d->nFxState; i++) {
+//      tl_assert(d->fxState[i].fx != Ifx_None);
+//      if (d->fxState[i].fx == Ifx_Write)
+//         continue;
+//
+//      /* Ignore any sections marked as 'always defined'. */
+//      if (isAlwaysDefd(mce, d->fxState[i].offset, d->fxState[i].size )) {
+//         if (0)
+//         VG_(printf)("memcheck: Dirty gst: ignored off %d, sz %d\n",
+//                     d->fxState[i].offset, d->fxState[i].size );
+//         continue;
+//      }
+//
+//      /* This state element is read or modified.  So we need to
+//         consider it.  If larger than 8 bytes, deal with it in 8-byte
+//         chunks. */
+//      gSz  = d->fxState[i].size;
+//      gOff = d->fxState[i].offset;
+//      tl_assert(gSz > 0);
+//      while (True) {
+//         if (gSz == 0) break;
+//         n = gSz <= 8 ? gSz : 8;
+//         /* update 'curr' with UifU of the state slice
+//            gOff .. gOff+n-1 */
+//         tySrc = szToITy( n );
+//         src   = assignNew( 'V', mce, tySrc,
+//                                 shadow_GET(mce, gOff, tySrc ) );
+//         here = mkPCastTo( mce, Ity_I32, src );
+//         curr = mkUifU32(mce, here, curr);
+//         gSz -= n;
+//         gOff += n;
+//      }
+//
+//   }
 
    /* Inputs: memory.  First set up some info needed regardless of
       whether we're doing reads or writes. */
@@ -3265,28 +3333,62 @@ void do_shadow_Dirty ( MCEnv* mce, IRDirty* d ) // 3224
       tl_assert(d->fxState[i].fx != Ifx_None);
       if (d->fxState[i].fx == Ifx_Read)
          continue;
-      /* Ignore any sections marked as 'always defined'. */
-      if (isAlwaysDefd(mce, d->fxState[i].offset, d->fxState[i].size ))
-         continue;
-      /* This state element is written or modified.  So we need to
-         consider it.  If larger than 8 bytes, deal with it in 8-byte
-         chunks. */
-      gSz  = d->fxState[i].size;
-      gOff = d->fxState[i].offset;
-      tl_assert(gSz > 0);
-      while (True) {
-         if (gSz == 0) break;
-         n = gSz <= 8 ? gSz : 8;
-         /* Write suitably-casted 'curr' to the state slice
-            gOff .. gOff+n-1 */
-         tyDst = szToITy( n );
-         do_shadow_PUT( mce, gOff,
-                             NULL, /* original atom */
-                             mkPCastTo( mce, tyDst, curr ) );
-         gSz -= n;
-         gOff += n;
+
+      /* Enumerate the described state segments */
+      for (k = 0; k < 1 + d->fxState[i].nRepeats; k++) {
+         gOff = d->fxState[i].offset + k * d->fxState[i].repeatLen;
+         gSz  = d->fxState[i].size;
+
+         /* Ignore any sections marked as 'always defined'. */
+         if (isAlwaysDefd(mce, gOff, gSz))
+            continue;
+
+         /* This state element is written or modified.  So we need to
+            consider it.  If larger than 8 bytes, deal with it in
+            8-byte chunks. */
+         while (True) {
+            tl_assert(gSz >= 0);
+            if (gSz == 0) break;
+            n = gSz <= 8 ? gSz : 8;
+            /* Write suitably-casted 'curr' to the state slice 
+               gOff .. gOff+n-1 */
+            tyDst = szToITy( n );
+            do_shadow_PUT( mce, gOff,
+                                NULL, /* original atom */
+                                mkPCastTo( mce, tyDst, curr ), d->guard );
+            gSz -= n;
+            gOff += n;
+         }
       }
    }
+
+//   /* Outputs: guest state that we write or modify. */
+//   for (i = 0; i < d->nFxState; i++) {
+//      tl_assert(d->fxState[i].fx != Ifx_None);
+//      if (d->fxState[i].fx == Ifx_Read)
+//         continue;
+//      /* Ignore any sections marked as 'always defined'. */
+//      if (isAlwaysDefd(mce, d->fxState[i].offset, d->fxState[i].size ))
+//         continue;
+//      /* This state element is written or modified.  So we need to
+//         consider it.  If larger than 8 bytes, deal with it in 8-byte
+//         chunks. */
+//      gSz  = d->fxState[i].size;
+//      gOff = d->fxState[i].offset;
+//      tl_assert(gSz > 0);
+//      while (True) {
+//         if (gSz == 0) break;
+//         n = gSz <= 8 ? gSz : 8;
+//         /* Write suitably-casted 'curr' to the state slice
+//            gOff .. gOff+n-1 */
+//         tyDst = szToITy( n );
+//         do_shadow_PUT( mce, gOff,
+//                             NULL, /* original atom */
+//                             mkPCastTo( mce, tyDst, curr ) );
+//         gSz -= n;
+//         gOff += n;
+//      }
+//   }
 
    /* Outputs: memory that we write or modify.  Same comments about
       endianness as above apply. */
@@ -3744,14 +3846,14 @@ static Bool checkForBogusLiterals ( /*FLAT*/ IRStmt* st )
                return isBogusAtom(e->Iex.Binop.arg1)
                       || isBogusAtom(e->Iex.Binop.arg2);
             case Iex_Triop:
-               return isBogusAtom(e->Iex.Triop.arg1)
-                      || isBogusAtom(e->Iex.Triop.arg2)
-                      || isBogusAtom(e->Iex.Triop.arg3);
+               return isBogusAtom(e->Iex.Triop.details->arg1)
+                      || isBogusAtom(e->Iex.Triop.details->arg2)
+                      || isBogusAtom(e->Iex.Triop.details->arg3);
             case Iex_Qop:
-               return isBogusAtom(e->Iex.Qop.arg1)
-                      || isBogusAtom(e->Iex.Qop.arg2)
-                      || isBogusAtom(e->Iex.Qop.arg3)
-                      || isBogusAtom(e->Iex.Qop.arg4);
+               return isBogusAtom(e->Iex.Qop.details->arg1)
+                      || isBogusAtom(e->Iex.Qop.details->arg2)
+                      || isBogusAtom(e->Iex.Qop.details->arg3)
+                      || isBogusAtom(e->Iex.Qop.details->arg4);
             case Iex_Mux0X:
                return isBogusAtom(e->Iex.Mux0X.cond)
                       || isBogusAtom(e->Iex.Mux0X.expr0)
@@ -3779,8 +3881,8 @@ static Bool checkForBogusLiterals ( /*FLAT*/ IRStmt* st )
       case Ist_Put:
          return isBogusAtom(st->Ist.Put.data);
       case Ist_PutI:
-         return isBogusAtom(st->Ist.PutI.ix)
-                || isBogusAtom(st->Ist.PutI.data);
+         return isBogusAtom(st->Ist.PutI.details->ix)
+                || isBogusAtom(st->Ist.PutI.details->data);
       case Ist_Store:
          return isBogusAtom(st->Ist.Store.addr)
                 || isBogusAtom(st->Ist.Store.data);
@@ -4597,31 +4699,32 @@ IRDirty* create_dirty_WRTMP( MCEnv* mce, IRTemp tmp, IRExpr* e ){
          return create_dirty_RDTMP( mce, tmp, e->Iex.RdTmp.tmp );
 
       case Iex_Qop:
-         if( e->Iex.Qop.arg1->tag == Iex_Const &&
-             e->Iex.Qop.arg2->tag == Iex_Const &&
-             e->Iex.Qop.arg3->tag == Iex_Const &&
-             e->Iex.Qop.arg4->tag == Iex_Const &&
+         if( e->Iex.Qop.details->arg1->tag == Iex_Const &&
+             e->Iex.Qop.details->arg2->tag == Iex_Const &&
+             e->Iex.Qop.details->arg3->tag == Iex_Const &&
+             e->Iex.Qop.details->arg4->tag == Iex_Const &&
              TNT_(clo_tainted_ins_only) )
             return NULL;
          else
             return create_dirty_QOP(
                    mce, tmp,
-                   e->Iex.Qop.op,
-                   e->Iex.Qop.arg1, e->Iex.Qop.arg2,
-                   e->Iex.Qop.arg3, e->Iex.Qop.arg4
+                   e->Iex.Qop.details->op,
+                   e->Iex.Qop.details->arg1, e->Iex.Qop.details->arg2,
+                   e->Iex.Qop.details->arg3, e->Iex.Qop.details->arg4
                 );
 
      case Iex_Triop:
-         if( e->Iex.Triop.arg1->tag == Iex_Const &&
-             e->Iex.Triop.arg2->tag == Iex_Const &&
-             e->Iex.Triop.arg3->tag == Iex_Const &&
+         if( e->Iex.Triop.details->arg1->tag == Iex_Const &&
+             e->Iex.Triop.details->arg2->tag == Iex_Const &&
+             e->Iex.Triop.details->arg3->tag == Iex_Const &&
              TNT_(clo_tainted_ins_only) )
             return NULL;
          else
             return create_dirty_TRIOP(
                    mce, tmp,
-                   e->Iex.Triop.op,
-                   e->Iex.Triop.arg1, e->Iex.Triop.arg2, e->Iex.Triop.arg3
+                   e->Iex.Triop.details->op,
+                   e->Iex.Triop.details->arg1, e->Iex.Triop.details->arg2,
+                   e->Iex.Triop.details->arg3
                 );
 
       case Iex_Binop:
@@ -5691,15 +5794,16 @@ typedef
             do_shadow_PUT( &mce,
                            st->Ist.Put.offset,
                            st->Ist.Put.data,
-                           NULL /* shadow atom */ );
+                           NULL /* shadow atom */, NULL /* guard */ );
             break;
 
          case Ist_PutI:
-            do_shadow_PUTI( &mce,
-                            st->Ist.PutI.descr,
-                            st->Ist.PutI.ix,
-                            st->Ist.PutI.bias,
-                            st->Ist.PutI.data );
+              do_shadow_PUTI( &mce, st->Ist.PutI.details);
+//            do_shadow_PUTI( &mce,
+//                            st->Ist.PutI.details->descr,
+//                            st->Ist.PutI.details->ix,
+//                            st->Ist.PutI.details->bias,
+//                            st->Ist.PutI.details->data );
             break;
 
          case Ist_Store:

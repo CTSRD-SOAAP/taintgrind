@@ -10,11 +10,16 @@ const char *IRType_string[] = {
    "I16",
    "I32",
    "I64",
-   "I128",
-   "F32",
-   "F64",
-   "F128",
-   "V128" };
+   "I128",  /* 128-bit scalar */
+   "F32",   /* IEEE 754 float */
+   "F64",   /* IEEE 754 double */
+   "D32",   /* 32-bit Decimal floating point */
+   "D64",   /* 64-bit Decimal floating point */
+   "D128",  /* 128-bit Decimal floating point */
+   "F128",  /* 128-bit floating point; implementation defined */
+   "V128",  /* 128-bit SIMD */
+   "V256"   /* 256-bit SIMD */
+};
 
 #define IRType_MAX ( sizeof(IRType_string)/sizeof(IRType_string[0]) )
 
