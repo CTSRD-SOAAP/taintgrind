@@ -2652,6 +2652,19 @@ Int get_and_check_tvar( Char *tmp ){
    return tmpnum;
 }
 
+void infer_client_binary_name(UInt pc) {
+
+   if (client_binary_name == NULL) {
+      DebugInfo* di = VG_(find_DebugInfo)(pc);
+      if (di && VG_(strcmp)(VG_(DebugInfo_get_soname)(di), "NONE") == 0) {
+         VG_(printf)("client_binary_name: %s\n", VG_(DebugInfo_get_filename)(di));
+         client_binary_name = (Char*)VG_(malloc)("client_binary_name",sizeof(Char)*(VG_(strlen)(VG_(DebugInfo_get_filename)(di)+1)));
+         VG_(strcpy)(client_binary_name, VG_(DebugInfo_get_filename)(di));
+      }  
+   }
+
+}
+
 VG_REGPARM(3)
 void TNT_(helperc_0_tainted_enc32) (
    UInt enc0, 
@@ -2666,6 +2679,11 @@ void TNT_(helperc_0_tainted_enc32) (
    Char  aTmp[128];
    UInt  enc[4] = { enc0, enc1, enc2, enc3 };
 
+   pc = VG_(get_IP)( VG_(get_running_tid)() );
+   
+   // hack to get name of application binary
+   infer_client_binary_name(pc);
+
    if( TNT_(clo_critical_ins_only) &&
        ( enc[0] & 0xf8000000 ) != 0xB8000000 )
       return;
@@ -2676,7 +2694,6 @@ void TNT_(helperc_0_tainted_enc32) (
    if(TNT_(do_print)){
       if((TNT_(clo_tainted_ins_only) && taint) ||
           !TNT_(clo_tainted_ins_only)){
-         pc = VG_(get_IP)( VG_(get_running_tid)() );
          VG_(describe_IP) ( pc, fnname, FNNAME_MAX );
 
          decode_string( enc, aTmp );
@@ -2946,6 +2963,10 @@ void TNT_(helperc_1_tainted_enc32) (
    UInt  enc[4] = { enc0, enc1, enc2/*0xffffffff*/, 0xffffffff };
 
    ThreadId tid = VG_(get_running_tid());
+
+   // hack to infer client binary name
+   UInt pc = VG_(get_IP)( tid );
+   infer_client_binary_name( pc );
 
    decode_string( enc, aTmp );
    //VG_(printf)("decoded string %s\n", aTmp);
@@ -3616,6 +3637,7 @@ void TNT_(helperc_4_tainted) (
 
 void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum VariableType* type, enum VariableLocation* loc) {
 
+
 	// first try to see if it is a global var
 	PtrdiffT pdt;
 	VG_(get_datasym_and_offset)( addr, varnamebuf, bufsize, &pdt );
@@ -3733,16 +3755,34 @@ void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum Variabl
 
 		if (have_created_sandbox || IN_SANDBOX) {
 			tl_assert(client_binary_name != NULL);
-//
-//			// let's determine it's location:
-			// It is external from this application if:
-			//   1) The binary in which it is declared is not the same as the
-			//      binary we are currently executing
-			//   2) var name contains @@ in the name
+
+			// let's determine it's location:
+			// It is external from this application if the soname 
+      // field in its DebugInfo is non-empty
+      /*VG_(printf)("var: %s\n", varnamebuf);
+      DebugInfo* di = NULL;
+      while (di = VG_(next_DebugInfo)(di)) {
+        VG_(printf)("  soname: %s, filename: %s, handle: %d\n", VG_(DebugInfo_get_soname)(di), VG_(DebugInfo_get_filename)(di), VG_(DebugInfo_get_handle)(di));
+        XArray* gbs = VG_(di_get_global_blocks_from_dihandle)(VG_(DebugInfo_get_handle)(di), True);
+        //tl_assert(gbs);
+        int i, n = VG_(sizeXA)( gbs );
+        VG_(printf)("  n: %d\n", n);
+        for (i = 0; i < n; i++) {
+          GlobalBlock* gbp;
+          GlobalBlock* gb = VG_(indexXA)( gbs, i );
+          if (0) VG_(printf)("   new Global size %2lu at %#lx:  %s %s\n",
+                             gb->szB, gb->addr, gb->soname, gb->name );
+        }
+      }*/
+      //DebugInfo* di = VG_(find_DebugInfo)(addr);
+      //VG_(printf)("var: %s, di: %d\n", varnamebuf, di);
+      
 			UInt pc = VG_(get_IP)(VG_(get_running_tid)());
 			Char binarynamebuf[1024];
 			VG_(get_objname)(pc, binarynamebuf, 1024);
+      //VG_(printf)("var: %s, declaring binary: %s, client binary: %s\n", varnamebuf, binarynamebuf, client_binary_name);
 			*loc = (VG_(strcmp)(binarynamebuf, client_binary_name) == 0 && VG_(strstr)(varnamebuf, "@@") == NULL) ? GlobalFromApplication : GlobalFromElsewhere;
+      //*loc = GlobalFromElsewhere;
 		}
 	}
 }
@@ -3953,13 +3993,6 @@ Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret ) {
 			callgate_nesting_depth--;
 			break;
 		}
-	}
-	// initialise binary_name on first client request
-	if (client_binary_name == NULL) {
-		UInt pc = VG_(get_IP)(tid);
-		client_binary_name = (Char*)VG_(malloc)("client_binary_name",sizeof(Char)*1024);
-		VG_(get_objname)(pc, client_binary_name, 1024);
-		VG_(printf)("client_binary_name: %s\n", client_binary_name);
 	}
 	return True;
 }
