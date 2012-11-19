@@ -2345,6 +2345,7 @@ void post_decode_string_load( Char *aStr ){
    tl_assert( pChr );
 
    VG_(strncpy)( aTmp1, aStr, pChr-aStr+1 );
+   aTmp1[pChr-aStr+1] = 0;
    i = pChr-aStr;
 
    if( aStr[i+1] == ' '       && 
@@ -2381,6 +2382,7 @@ void post_decode_string_primops( Char *aStr ){
    tl_assert( pChr );
 
    VG_(strncpy)( aTmp1, aStr, pChr-aStr+1 );
+   aTmp1[pChr-aStr+1] = 0;
    i = pChr-aStr;
 
    if( aStr[i+1] == ' '       && 
@@ -2544,6 +2546,7 @@ void post_decode_string_mux0x( Char *aStr ){
    tl_assert( pChr );
 
    VG_(strncpy)( aTmp1, aStr, pChr-aStr+1 );
+   aTmp1[pChr-aStr+1] = 0;
    VG_(strncpy)( aTmp2, pChr+2, 127 );
 
    tl_assert( VG_(strlen)( aTmp1 ) +
