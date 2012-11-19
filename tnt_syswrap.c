@@ -49,20 +49,20 @@
 
 #include "tnt_include.h"
 
-//static
-//void resolve_fd(UWord fd, Char *path, Int max)
-//{
-//   Char src[FD_MAX_PATH];
-//   Int len = 0;
-//
-//   // TODO: Cache resolved fds by also catching open()s and close()s
-//   VG_(sprintf)(src, "/proc/%d/fd/%d", VG_(getpid)(), (int)fd);
-//   len = VG_(readlink)(src, path, max);
-//
-//   // Just give emptiness on error.
-//   if (len == -1) len = 0;
-//   path[len] = '\0';
-//}
+static
+void resolve_filename(UWord fd, Char *path, Int max)
+{
+   Char src[FD_MAX_PATH];
+   Int len = 0;
+
+   // TODO: Cache resolved fds by also catching open()s and close()s
+   VG_(sprintf)(src, "/proc/%d/fd/%d", VG_(getpid)(), (int)fd);
+   len = VG_(readlink)(src, path, max);
+
+   // Just give emptiness on error.
+   if (len == -1) len = 0;
+   path[len] = '\0';
+}
 
 /* enforce an arbitrary maximum */
 static Bool tainted_fds[VG_N_THREADS][FD_MAX];
@@ -331,7 +331,13 @@ void TNT_(syscall_open)(ThreadId tid, UWord* args, UInt nArgs, SysRes res) {
 
    // check if we have already created a sandbox
    if (have_created_sandbox && !IN_SANDBOX) {
+#ifdef VGO_freebsd
 	   VG_(resolve_filename)(fd, fdpath, FD_MAX_PATH-1);
+#elif defined VGO_linux
+	   resolve_filename(fd, fdpath, FD_MAX_PATH-1);
+#else
+#error OS unknown
+#endif
 	   HChar fnname[FNNAME_MAX];
 	   TNT_(get_fnname)(tid, fnname, FNNAME_MAX);
 	   VG_(printf)("*** The file %s (fd: %d) was opened in method %s after a sandbox was created, hence it will not be accessible to the sandbox. It will need to be passed to the sandbox using sendmsg. ***\n", fdpath, fd, fnname);
@@ -345,8 +351,13 @@ void TNT_(syscall_open)(ThreadId tid, UWord* args, UInt nArgs, SysRes res) {
 
     if (fd > -1 && fd < FD_MAX) {
 
-        //resolve_fd(fd, fdpath, MAX_PATH-1);
+#ifdef VGO_freebsd
 	VG_(resolve_filename)(fd, fdpath, FD_MAX_PATH-1);
+#elif defined VGO_linux
+        resolve_filename(fd, fdpath, FD_MAX_PATH-1);
+#else
+#error OS unknown
+#endif
 
         if( TNT_(clo_taint_all) ){
             // Turn instrumentation on
@@ -426,7 +437,13 @@ void TNT_(check_fd_access)(ThreadId tid, UInt fd, Int fd_request) {
 				}
 			}
 			HChar fdpath[FD_MAX_PATH];
+#ifdef VGO_freebsd
 			VG_(resolve_filename)(fd, fdpath, FD_MAX_PATH-1);
+#elif defined VGO_linux
+			resolve_filename(fd, fdpath, FD_MAX_PATH-1);
+#else
+#error OS unknown
+#endif
 			HChar fnname[FNNAME_MAX];
 			TNT_(get_fnname)(tid, fnname, FNNAME_MAX);
 			VG_(printf)("*** Sandbox %s %s (fd: %d) in method %s, but it is not allowed to. ***\n", access_str, fdpath, fd, fnname);
