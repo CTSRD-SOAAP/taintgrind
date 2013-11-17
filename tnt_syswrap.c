@@ -5,11 +5,8 @@
 /*--------------------------------------------------------------------*/
 
 /*
-   This file is part of Tainter, a Valgrind tool for
+   This file is part of Taintgrind, a Valgrind tool for
    tracking marked/tainted data through memory.
-
-   Copyright (C) 2010 Wei Ming Khoo
-   wmk26@cam.ac.uk
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License as

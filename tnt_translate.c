@@ -6,9 +6,6 @@
 /*
    This file is part of Taintgrind, the taint analysis Valgrind tool.
 
-   Copyright (C) 2010 Wei Ming Khoo
-   wmk26@cam.ac.uk
-
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License as
    published by the Free Software Foundation; either version 2 of the
