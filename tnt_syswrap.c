@@ -50,9 +50,9 @@
 #include "tnt_include.h"
 
 static
-void resolve_filename(UWord fd, Char *path, Int max)
+void resolve_filename(UWord fd, HChar *path, Int max)
 {
-   Char src[FD_MAX_PATH];
+   HChar src[FD_MAX_PATH];
    Int len = 0;
 
    // TODO: Cache resolved fds by also catching open()s and close()s

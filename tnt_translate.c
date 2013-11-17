@@ -114,6 +114,12 @@ typedef
          found.  Starts off False, and may change to True. */
       Bool    bogusLiterals;
 
+      /* READONLY: indicates whether we should use expensive
+         interpretations of integer adds, since unfortunately LLVM
+         uses them to do ORs in some circumstances.  Defaulted to True
+         on MacOS and False everywhere else. */
+      Bool useLLVMworkarounds;
+
       /* READONLY: the guest layout.  This indicates which parts of
          the guest state should be regarded as 'always defined'. */
       VexGuestLayout* layout;
@@ -377,6 +383,12 @@ static IRAtom* mkDifDV128 ( MCEnv* mce, IRAtom* a1, IRAtom* a2 ) {
    return assignNew('V', mce, Ity_V128, binop(Iop_AndV128, a1, a2));
 }
 
+static IRAtom* mkDifDV256 ( MCEnv* mce, IRAtom* a1, IRAtom* a2 ) {
+   tl_assert(isShadowAtom(mce,a1));
+   tl_assert(isShadowAtom(mce,a2));
+   return assignNew('V', mce, Ity_V256, binop(Iop_AndV256, a1, a2));
+}
+
 /* --------- Undefined-if-either-undefined --------- */
 
 static IRAtom* mkUifU8 ( MCEnv* mce, IRAtom* a1, IRAtom* a2 ) {
@@ -409,6 +421,12 @@ static IRAtom* mkUifUV128 ( MCEnv* mce, IRAtom* a1, IRAtom* a2 ) {
    return assignNew('V', mce, Ity_V128, binop(Iop_OrV128, a1, a2));
 }
 
+static IRAtom* mkUifUV256 ( MCEnv* mce, IRAtom* a1, IRAtom* a2 ) {
+   tl_assert(isShadowAtom(mce,a1));
+   tl_assert(isShadowAtom(mce,a2));
+   return assignNew('V', mce, Ity_V256, binop(Iop_OrV256, a1, a2));
+}
+
 static IRAtom* mkUifU ( MCEnv* mce, IRType vty, IRAtom* a1, IRAtom* a2 ) {
    switch (vty) {
       case Ity_I8:   return mkUifU8(mce, a1, a2);
@@ -416,6 +434,7 @@ static IRAtom* mkUifU ( MCEnv* mce, IRType vty, IRAtom* a1, IRAtom* a2 ) {
       case Ity_I32:  return mkUifU32(mce, a1, a2);
       case Ity_I64:  return mkUifU64(mce, a1, a2);
       case Ity_V128: return mkUifUV128(mce, a1, a2);
+      case Ity_V256: return mkUifUV256(mce, a1, a2);
       default:
          VG_(printf)("\n"); ppIRType(vty); VG_(printf)("\n");
          VG_(tool_panic)("tnt_translate.c:mkUifU");
@@ -489,6 +508,14 @@ static IRAtom* mkImproveANDV128 ( MCEnv* mce, IRAtom* data, IRAtom* vbits )
    return assignNew('V', mce, Ity_V128, binop(Iop_OrV128, data, vbits));
 }
 
+static IRAtom* mkImproveANDV256 ( MCEnv* mce, IRAtom* data, IRAtom* vbits )
+{
+   tl_assert(isOriginalAtom(mce, data));
+   tl_assert(isShadowAtom(mce, vbits));
+   tl_assert(sameKindedAtoms(data, vbits));
+   return assignNew('V', mce, Ity_V256, binop(Iop_OrV256, data, vbits));
+}
+
 /* ImproveOR(data, vbits) = ~data OR vbits.  Defined (0) data 1s give
    defined (0); all other -> undefined (1).
 */
@@ -549,6 +576,18 @@ static IRAtom* mkImproveORV128 ( MCEnv* mce, IRAtom* data, IRAtom* vbits )
              'V', mce, Ity_V128,
              binop(Iop_OrV128,
                    assignNew('V', mce, Ity_V128, unop(Iop_NotV128, data)),
+                   vbits) );
+}
+
+static IRAtom* mkImproveORV256 ( MCEnv* mce, IRAtom* data, IRAtom* vbits )
+{
+   tl_assert(isOriginalAtom(mce, data));
+   tl_assert(isShadowAtom(mce, vbits));
+   tl_assert(sameKindedAtoms(data, vbits));
+   return assignNew(
+             'V', mce, Ity_V256,
+             binop(Iop_OrV256,
+                   assignNew('V', mce, Ity_V256, unop(Iop_NotV256, data)),
                    vbits) );
 }
 
@@ -812,7 +851,7 @@ static void setHelperAnns ( MCEnv* mce, IRDirty* di ) { //970
 
 // Taintgrind: Forward decls
 Int encode_char( Char c );
-void encode_string( Char *aStr, UInt *enc, UInt enc_size );
+void encode_string( HChar *aStr, UInt *enc, UInt enc_size );
 
 Int extract_IRAtom( IRAtom* atom );
 Int extract_IRConst( IRConst* con );
@@ -846,8 +885,8 @@ IRDirty* create_dirty_LOAD( MCEnv* mce, IRTemp tmp, Bool isLL, IREndness end,
                             IRType ty, IRExpr* addr );
 IRDirty* create_dirty_CCALL( MCEnv* mce, IRTemp tmp, 
                              IRCallee* cee, IRType retty, IRExpr** args );
-IRDirty* create_dirty_MUX0X( MCEnv* mce, IRTemp tmp, 
-                             IRExpr* cond, IRExpr* exprX, IRExpr* expr0 );
+IRDirty* create_dirty_ITE( MCEnv* mce, IRTemp tmp, 
+                           IRExpr* cond, IRExpr* iftrue, IRExpr* iffalse );
 IRDirty* create_dirty_from_dirty( IRDirty* di_old );
 
 /* Check the supplied **original** atom for undefinedness, and emit
@@ -1020,10 +1059,10 @@ void do_shadow_PUT ( MCEnv* mce,  Int offset,  //1191
             that is already stored in the guest state slot */
          IRAtom *cond, *iffalse;
 
-         cond    = assignNew('V', mce, Ity_I8, unop(Iop_1Uto8, guard));
+         cond    = assignNew('V', mce, Ity_I1, guard);
          iffalse = assignNew('V', mce, ty,
                              IRExpr_Get(offset + mce->layout->total_sizeB, ty));
-         vatom   = assignNew('V', mce, ty, IRExpr_Mux0X(cond, iffalse, vatom));
+         vatom   = assignNew('V', mce, ty, IRExpr_ITE(cond, vatom, iffalse));
       }
       stmt( 'V', mce, IRStmt_Put( offset + mce->layout->total_sizeB, vatom ) );
 
@@ -1045,7 +1084,7 @@ void do_shadow_PUTI ( MCEnv* mce, IRPutI *puti ) // 1344
 {
    IRAtom* vatom;
    IRType  ty, tyS;
-   Int     arrSize;
+   //Int     arrSize;
    IRRegArray* descr = puti->descr;
    IRAtom*     ix    = puti->ix;
    Int         bias  = puti->bias;
@@ -1064,7 +1103,7 @@ void do_shadow_PUTI ( MCEnv* mce, IRPutI *puti ) // 1344
    tl_assert(sameKindedAtoms(atom, vatom));
    ty   = descr->elemTy;
    tyS  = shadowTypeV(ty);
-   arrSize = descr->nElems * sizeofIRType(ty);
+   //arrSize = descr->nElems * sizeofIRType(ty);
    tl_assert(ty != Ity_I1);
    tl_assert(isOriginalAtom(mce,ix));
 
@@ -1463,6 +1502,59 @@ IRAtom* expensiveAddSub ( MCEnv*  mce,
 
 }
 
+static
+IRAtom* expensiveCountTrailingZeroes ( MCEnv* mce, IROp czop,
+                                       IRAtom* atom, IRAtom* vatom )
+{
+   IRType ty;
+   IROp xorOp, subOp, andOp;
+   IRExpr *one;
+   IRAtom *improver, *improved;
+   tl_assert(isShadowAtom(mce,vatom));
+   tl_assert(isOriginalAtom(mce,atom));
+   tl_assert(sameKindedAtoms(atom,vatom));
+
+   switch (czop) {
+      case Iop_Ctz32:
+         ty = Ity_I32;
+         xorOp = Iop_Xor32;
+         subOp = Iop_Sub32;
+         andOp = Iop_And32;
+         one = mkU32(1);
+         break;
+      case Iop_Ctz64:
+         ty = Ity_I64;
+         xorOp = Iop_Xor64;
+         subOp = Iop_Sub64;
+         andOp = Iop_And64;
+         one = mkU64(1);
+         break;
+      default:
+         ppIROp(czop);
+         VG_(tool_panic)("memcheck:expensiveCountTrailingZeroes");
+   }
+
+   // improver = atom ^ (atom - 1)
+   //
+   // That is, improver has its low ctz(atom) bits equal to one;
+   // higher bits (if any) equal to zero.
+   improver = assignNew('V', mce,ty,
+                        binop(xorOp,
+                              atom,
+                              assignNew('V', mce, ty,
+                                        binop(subOp, atom, one))));
+
+   // improved = vatom & improver
+   //
+   // That is, treat any V bits above the first ctz(atom) bits as
+   // "defined".
+   improved = assignNew('V', mce, ty,
+                        binop(andOp, vatom, improver));
+
+   // Return pessimizing cast of improved.
+   return mkPCastTo(mce, ty, improved);
+}
+
 
 /*------------------------------------------------------------*/
 /*--- Scalar shifts.                                       ---*/
@@ -1516,9 +1608,24 @@ static IRAtom* mkPCast64x2 ( MCEnv* mce, IRAtom* at )
    return assignNew('V', mce, Ity_V128, unop(Iop_CmpNEZ64x2, at));
 }
 
+static IRAtom* mkPCast64x4 ( MCEnv* mce, IRAtom* at )
+{
+   return assignNew('V', mce, Ity_V256, unop(Iop_CmpNEZ64x4, at));
+}
+
+static IRAtom* mkPCast32x8 ( MCEnv* mce, IRAtom* at )
+{
+   return assignNew('V', mce, Ity_V256, unop(Iop_CmpNEZ32x8, at));
+}
+
 static IRAtom* mkPCast32x2 ( MCEnv* mce, IRAtom* at )
 {
    return assignNew('V', mce, Ity_I64, unop(Iop_CmpNEZ32x2, at));
+}
+
+static IRAtom* mkPCast16x16 ( MCEnv* mce, IRAtom* at )
+{
+   return assignNew('V', mce, Ity_V256, unop(Iop_CmpNEZ16x16, at));
 }
 
 static IRAtom* mkPCast16x4 ( MCEnv* mce, IRAtom* at )
@@ -1526,9 +1633,24 @@ static IRAtom* mkPCast16x4 ( MCEnv* mce, IRAtom* at )
    return assignNew('V', mce, Ity_I64, unop(Iop_CmpNEZ16x4, at));
 }
 
+static IRAtom* mkPCast8x32 ( MCEnv* mce, IRAtom* at )
+{
+   return assignNew('V', mce, Ity_V256, unop(Iop_CmpNEZ8x32, at));
+}
+
 static IRAtom* mkPCast8x8 ( MCEnv* mce, IRAtom* at )
 {
    return assignNew('V', mce, Ity_I64, unop(Iop_CmpNEZ8x8, at));
+}
+
+static IRAtom* mkPCast16x2 ( MCEnv* mce, IRAtom* at )
+{
+   return assignNew('V', mce, Ity_I32, unop(Iop_CmpNEZ16x2, at));
+}
+
+static IRAtom* mkPCast8x4 ( MCEnv* mce, IRAtom* at )
+{
+   return assignNew('V', mce, Ity_I32, unop(Iop_CmpNEZ8x4, at));
 }
 
 /* Here's a simple scheme capable of handling ops derived from SSE1
@@ -1621,6 +1743,72 @@ IRAtom* unary64F0x2 ( MCEnv* mce, IRAtom* vatomX )
    at = assignNew('V', mce, Ity_I64, unop(Iop_V128to64, vatomX));
    at = mkPCastTo(mce, Ity_I64, at);
    at = assignNew('V', mce, Ity_V128, binop(Iop_SetV128lo64, vatomX, at));
+   return at;
+}
+
+/* --- --- ... and ... 32Fx2 versions of the same --- --- */
+
+static
+IRAtom* binary32Fx2 ( MCEnv* mce, IRAtom* vatomX, IRAtom* vatomY )
+{
+   IRAtom* at;
+   tl_assert(isShadowAtom(mce, vatomX));
+   tl_assert(isShadowAtom(mce, vatomY));
+   at = mkUifU64(mce, vatomX, vatomY);
+   at = assignNew('V', mce, Ity_I64, mkPCast32x2(mce, at));
+   return at;
+}
+
+static
+IRAtom* unary32Fx2 ( MCEnv* mce, IRAtom* vatomX )
+{
+   IRAtom* at;
+   tl_assert(isShadowAtom(mce, vatomX));
+   at = assignNew('V', mce, Ity_I64, mkPCast32x2(mce, vatomX));
+   return at;
+}
+
+/* --- ... and ... 64Fx4 versions of the same ... --- */
+
+static
+IRAtom* binary64Fx4 ( MCEnv* mce, IRAtom* vatomX, IRAtom* vatomY )
+{
+   IRAtom* at;
+   tl_assert(isShadowAtom(mce, vatomX));
+   tl_assert(isShadowAtom(mce, vatomY));
+   at = mkUifUV256(mce, vatomX, vatomY);
+   at = assignNew('V', mce, Ity_V256, mkPCast64x4(mce, at));
+   return at;
+}
+
+static
+IRAtom* unary64Fx4 ( MCEnv* mce, IRAtom* vatomX )
+{
+   IRAtom* at;
+   tl_assert(isShadowAtom(mce, vatomX));
+   at = assignNew('V', mce, Ity_V256, mkPCast64x4(mce, vatomX));
+   return at;
+}
+
+/* --- ... and ... 32Fx8 versions of the same ... --- */
+
+static
+IRAtom* binary32Fx8 ( MCEnv* mce, IRAtom* vatomX, IRAtom* vatomY )
+{
+   IRAtom* at;
+   tl_assert(isShadowAtom(mce, vatomX));
+   tl_assert(isShadowAtom(mce, vatomY));
+   at = mkUifUV256(mce, vatomX, vatomY);
+   at = assignNew('V', mce, Ity_V256, mkPCast32x8(mce, at));
+   return at;
+}
+
+static
+IRAtom* unary32Fx8 ( MCEnv* mce, IRAtom* vatomX )
+{
+   IRAtom* at;
+   tl_assert(isShadowAtom(mce, vatomX));
+   at = assignNew('V', mce, Ity_V256, mkPCast32x8(mce, vatomX));
    return at;
 }
 
@@ -1772,6 +1960,44 @@ IRAtom* vectorWidenI64 ( MCEnv* mce, IROp longen_op,
 
 /* Simple ... UifU the args and per-lane pessimise the results. */
 
+/* --- V256-bit versions --- */
+
+static
+IRAtom* binary8Ix32 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
+{
+   IRAtom* at;
+   at = mkUifUV256(mce, vatom1, vatom2);
+   at = mkPCast8x32(mce, at);
+   return at;
+}
+
+static
+IRAtom* binary16Ix16 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
+{
+   IRAtom* at;
+   at = mkUifUV256(mce, vatom1, vatom2);
+   at = mkPCast16x16(mce, at);
+   return at;
+}
+
+static
+IRAtom* binary32Ix8 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
+{
+   IRAtom* at;
+   at = mkUifUV256(mce, vatom1, vatom2);
+   at = mkPCast32x8(mce, at);
+   return at;
+}
+
+static
+IRAtom* binary64Ix4 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
+{
+   IRAtom* at;
+   at = mkUifUV256(mce, vatom1, vatom2);
+   at = mkPCast64x4(mce, at);
+   return at;
+}
+
 /* --- V128-bit versions --- */
 
 static
@@ -1836,6 +2062,35 @@ IRAtom* binary32Ix2 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
    IRAtom* at;
    at = mkUifU64(mce, vatom1, vatom2);
    at = mkPCast32x2(mce, at);
+   return at;
+}
+
+static
+IRAtom* binary64Ix1 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
+{
+   IRAtom* at;
+   at = mkUifU64(mce, vatom1, vatom2);
+   at = mkPCastTo(mce, Ity_I64, at);
+   return at;
+}
+
+/* --- 32-bit versions --- */
+
+static
+IRAtom* binary8Ix4 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
+{
+   IRAtom* at;
+   at = mkUifU32(mce, vatom1, vatom2);
+   at = mkPCast8x4(mce, at);
+   return at;
+}
+
+static
+IRAtom* binary16Ix2 ( MCEnv* mce, IRAtom* vatom1, IRAtom* vatom2 )
+{
+   IRAtom* at;
+   at = mkUifU32(mce, vatom1, vatom2);
+   at = mkPCast16x2(mce, at);
    return at;
 }
 
@@ -1926,9 +2181,8 @@ IRAtom* expr2vbits_Triop ( MCEnv* mce,
    }
 }
 
-
-static
-IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
+static 
+IRAtom* expr2vbits_Binop ( MCEnv* mce,
                            IROp op,
                            IRAtom* atom1, IRAtom* atom2 )
 {
@@ -1937,11 +2191,8 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
    IRAtom* (*difd)    (MCEnv*, IRAtom*, IRAtom*);
    IRAtom* (*improve) (MCEnv*, IRAtom*, IRAtom*);
 
-//   VG_(printf)("expr2vbits_Binop\n");
-//   ppIRExpr(atom1); VG_(printf)("\n");
-
-   IRAtom* vatom1 = atom2vbits( mce, atom1 );
-   IRAtom* vatom2 = atom2vbits( mce, atom2 );
+   IRAtom* vatom1 = expr2vbits( mce, atom1 );
+   IRAtom* vatom2 = expr2vbits( mce, atom2 );
 
    tl_assert(isOriginalAtom(mce,atom1));
    tl_assert(isOriginalAtom(mce,atom2));
@@ -1951,8 +2202,35 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
    tl_assert(sameKindedAtoms(atom2,vatom2));
    switch (op) {
 
+      /* 32-bit SIMD */
+
+      case Iop_Add16x2:
+      case Iop_HAdd16Ux2:
+      case Iop_HAdd16Sx2:
+      case Iop_Sub16x2:
+      case Iop_HSub16Ux2:
+      case Iop_HSub16Sx2:
+      case Iop_QAdd16Sx2:
+      case Iop_QSub16Sx2:
+      case Iop_QSub16Ux2:
+      case Iop_QAdd16Ux2:
+         return binary16Ix2(mce, vatom1, vatom2);
+
+      case Iop_Add8x4:
+      case Iop_HAdd8Ux4:
+      case Iop_HAdd8Sx4:
+      case Iop_Sub8x4:
+      case Iop_HSub8Ux4:
+      case Iop_HSub8Sx4:
+      case Iop_QSub8Ux4:
+      case Iop_QAdd8Ux4:
+      case Iop_QSub8Sx4:
+      case Iop_QAdd8Sx4:
+         return binary8Ix4(mce, vatom1, vatom2);
+
       /* 64-bit SIMD */
 
+      case Iop_ShrN8x8:
       case Iop_ShrN16x4:
       case Iop_ShrN32x2:
       case Iop_SarN8x8:
@@ -1962,8 +2240,7 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_ShlN32x2:
       case Iop_ShlN8x8:
          /* Same scheme as with all other shifts. */
-         // Taintgrind: Checked in do_shadow_WRTMP
-//         complainIfTainted(mce, atom2);
+         //complainIfUndefined(mce, atom2, NULL);
          return assignNew('V', mce, Ity_I64, binop(op, vatom1, atom2));
 
       case Iop_QNarrowBin32Sto16Sx4:
@@ -1972,20 +2249,29 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          return vectorNarrowBin64(mce, op, vatom1, vatom2);
 
       case Iop_Min8Ux8:
+      case Iop_Min8Sx8:
       case Iop_Max8Ux8:
+      case Iop_Max8Sx8:
       case Iop_Avg8Ux8:
       case Iop_QSub8Sx8:
       case Iop_QSub8Ux8:
       case Iop_Sub8x8:
       case Iop_CmpGT8Sx8:
+      case Iop_CmpGT8Ux8:
       case Iop_CmpEQ8x8:
       case Iop_QAdd8Sx8:
       case Iop_QAdd8Ux8:
+      case Iop_QSal8x8:
+      case Iop_QShl8x8:
       case Iop_Add8x8:
+      case Iop_Mul8x8:
+      case Iop_PolynomialMul8x8:
          return binary8Ix8(mce, vatom1, vatom2);
 
       case Iop_Min16Sx4:
+      case Iop_Min16Ux4:
       case Iop_Max16Sx4:
+      case Iop_Max16Ux4:
       case Iop_Avg16Ux4:
       case Iop_QSub16Ux4:
       case Iop_QSub16Sx4:
@@ -1994,18 +2280,145 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_MulHi16Sx4:
       case Iop_MulHi16Ux4:
       case Iop_CmpGT16Sx4:
+      case Iop_CmpGT16Ux4:
       case Iop_CmpEQ16x4:
       case Iop_QAdd16Sx4:
       case Iop_QAdd16Ux4:
+      case Iop_QSal16x4:
+      case Iop_QShl16x4:
       case Iop_Add16x4:
+      case Iop_QDMulHi16Sx4:
+      case Iop_QRDMulHi16Sx4:
          return binary16Ix4(mce, vatom1, vatom2);
 
       case Iop_Sub32x2:
       case Iop_Mul32x2:
+      case Iop_Max32Sx2:
+      case Iop_Max32Ux2:
+      case Iop_Min32Sx2:
+      case Iop_Min32Ux2:
       case Iop_CmpGT32Sx2:
+      case Iop_CmpGT32Ux2:
       case Iop_CmpEQ32x2:
       case Iop_Add32x2:
+      case Iop_QAdd32Ux2:
+      case Iop_QAdd32Sx2:
+      case Iop_QSub32Ux2:
+      case Iop_QSub32Sx2:
+      case Iop_QSal32x2:
+      case Iop_QShl32x2:
+      case Iop_QDMulHi32Sx2:
+      case Iop_QRDMulHi32Sx2:
          return binary32Ix2(mce, vatom1, vatom2);
+
+      case Iop_QSub64Ux1:
+      case Iop_QSub64Sx1:
+      case Iop_QAdd64Ux1:
+      case Iop_QAdd64Sx1:
+      case Iop_QSal64x1:
+      case Iop_QShl64x1:
+      case Iop_Sal64x1:
+         return binary64Ix1(mce, vatom1, vatom2);
+
+      case Iop_QShlN8Sx8:
+      case Iop_QShlN8x8:
+      case Iop_QSalN8x8:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast8x8(mce, vatom1);
+
+      case Iop_QShlN16Sx4:
+      case Iop_QShlN16x4:
+      case Iop_QSalN16x4:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast16x4(mce, vatom1);
+
+      case Iop_QShlN32Sx2:
+      case Iop_QShlN32x2:
+      case Iop_QSalN32x2:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast32x2(mce, vatom1);
+
+      case Iop_QShlN64Sx1:
+      case Iop_QShlN64x1:
+      case Iop_QSalN64x1:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast32x2(mce, vatom1);
+
+      case Iop_PwMax32Sx2:
+      case Iop_PwMax32Ux2:
+      case Iop_PwMin32Sx2:
+      case Iop_PwMin32Ux2:
+      case Iop_PwMax32Fx2:
+      case Iop_PwMin32Fx2:
+         return assignNew('V', mce, Ity_I64,
+                          binop(Iop_PwMax32Ux2, 
+                                mkPCast32x2(mce, vatom1),
+                                mkPCast32x2(mce, vatom2)));
+
+      case Iop_PwMax16Sx4:
+      case Iop_PwMax16Ux4:
+      case Iop_PwMin16Sx4:
+      case Iop_PwMin16Ux4:
+         return assignNew('V', mce, Ity_I64,
+                          binop(Iop_PwMax16Ux4,
+                                mkPCast16x4(mce, vatom1),
+                                mkPCast16x4(mce, vatom2)));
+
+      case Iop_PwMax8Sx8:
+      case Iop_PwMax8Ux8:
+      case Iop_PwMin8Sx8:
+      case Iop_PwMin8Ux8:
+         return assignNew('V', mce, Ity_I64,
+                          binop(Iop_PwMax8Ux8,
+                                mkPCast8x8(mce, vatom1),
+                                mkPCast8x8(mce, vatom2)));
+
+      case Iop_PwAdd32x2:
+      case Iop_PwAdd32Fx2:
+         return mkPCast32x2(mce,
+               assignNew('V', mce, Ity_I64,
+                         binop(Iop_PwAdd32x2,
+                               mkPCast32x2(mce, vatom1),
+                               mkPCast32x2(mce, vatom2))));
+
+      case Iop_PwAdd16x4:
+         return mkPCast16x4(mce,
+               assignNew('V', mce, Ity_I64,
+                         binop(op, mkPCast16x4(mce, vatom1),
+                                   mkPCast16x4(mce, vatom2))));
+
+      case Iop_PwAdd8x8:
+         return mkPCast8x8(mce,
+               assignNew('V', mce, Ity_I64,
+                         binop(op, mkPCast8x8(mce, vatom1),
+                                   mkPCast8x8(mce, vatom2))));
+
+      case Iop_Shl8x8:
+      case Iop_Shr8x8:
+      case Iop_Sar8x8:
+      case Iop_Sal8x8:
+         return mkUifU64(mce,
+                   assignNew('V', mce, Ity_I64, binop(op, vatom1, atom2)),
+                   mkPCast8x8(mce,vatom2)
+                );
+
+      case Iop_Shl16x4:
+      case Iop_Shr16x4:
+      case Iop_Sar16x4:
+      case Iop_Sal16x4:
+         return mkUifU64(mce,
+                   assignNew('V', mce, Ity_I64, binop(op, vatom1, atom2)),
+                   mkPCast16x4(mce,vatom2)
+                );
+
+      case Iop_Shl32x2:
+      case Iop_Shr32x2:
+      case Iop_Sar32x2:
+      case Iop_Sal32x2:
+         return mkUifU64(mce,
+                   assignNew('V', mce, Ity_I64, binop(op, vatom1, atom2)),
+                   mkPCast32x2(mce,vatom2)
+                );
 
       /* 64-bit data-steering */
       case Iop_InterleaveLO32x2:
@@ -2014,9 +2427,25 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_InterleaveHI32x2:
       case Iop_InterleaveHI16x4:
       case Iop_InterleaveHI8x8:
+      case Iop_CatOddLanes8x8:
+      case Iop_CatEvenLanes8x8:
       case Iop_CatOddLanes16x4:
       case Iop_CatEvenLanes16x4:
+      case Iop_InterleaveOddLanes8x8:
+      case Iop_InterleaveEvenLanes8x8:
+      case Iop_InterleaveOddLanes16x4:
+      case Iop_InterleaveEvenLanes16x4:
          return assignNew('V', mce, Ity_I64, binop(op, vatom1, vatom2));
+
+      case Iop_GetElem8x8:
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_I8, binop(op, vatom1, atom2));
+      case Iop_GetElem16x4:
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_I16, binop(op, vatom1, atom2));
+      case Iop_GetElem32x2:
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_I32, binop(op, vatom1, atom2));
 
       /* Perm8x8: rearrange values in left arg using steering values
         from right arg.  So rearrange the vbits in the same way but
@@ -2030,35 +2459,39 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
 
       /* V128-bit SIMD */
 
+      case Iop_ShrN8x16:
       case Iop_ShrN16x8:
       case Iop_ShrN32x4:
       case Iop_ShrN64x2:
+      case Iop_SarN8x16:
       case Iop_SarN16x8:
       case Iop_SarN32x4:
+      case Iop_SarN64x2:
+      case Iop_ShlN8x16:
       case Iop_ShlN16x8:
       case Iop_ShlN32x4:
       case Iop_ShlN64x2:
-      case Iop_ShlN8x16:
-      case Iop_SarN8x16:
          /* Same scheme as with all other shifts.  Note: 22 Oct 05:
             this is wrong now, scalar shifts are done properly lazily.
             Vector shifts should be fixed too. */
-         // Taintgrind: Checked in do_shadow_WRTMP
-//         complainIfTainted(mce, atom2);
+         //complainIfUndefined(mce, atom2, NULL);
          return assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2));
 
       /* V x V shifts/rotates are done using the standard lazy scheme. */
       case Iop_Shl8x16:
       case Iop_Shr8x16:
       case Iop_Sar8x16:
+      case Iop_Sal8x16:
       case Iop_Rol8x16:
          return mkUifUV128(mce,
                    assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
                    mkPCast8x16(mce,vatom2)
                 );
+
       case Iop_Shl16x8:
       case Iop_Shr16x8:
       case Iop_Sar16x8:
+      case Iop_Sal16x8:
       case Iop_Rol16x8:
          return mkUifUV128(mce,
                    assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
@@ -2068,11 +2501,36 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_Shl32x4:
       case Iop_Shr32x4:
       case Iop_Sar32x4:
+      case Iop_Sal32x4:
       case Iop_Rol32x4:
+      case Iop_Rol64x2:
          return mkUifUV128(mce,
                    assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
                    mkPCast32x4(mce,vatom2)
                 );
+
+      case Iop_Shl64x2:
+      case Iop_Shr64x2:
+      case Iop_Sar64x2:
+      case Iop_Sal64x2:
+         return mkUifUV128(mce,
+                   assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
+                   mkPCast64x2(mce,vatom2)
+                );
+
+      case Iop_F32ToFixed32Ux4_RZ:
+      case Iop_F32ToFixed32Sx4_RZ:
+      case Iop_Fixed32UToF32x4_RN:
+      case Iop_Fixed32SToF32x4_RN:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast32x4(mce, vatom1);
+
+      case Iop_F32ToFixed32Ux2_RZ:
+      case Iop_F32ToFixed32Sx2_RZ:
+      case Iop_Fixed32UToF32x2_RN:
+      case Iop_Fixed32SToF32x2_RN:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast32x2(mce, vatom1);
 
       case Iop_QSub8Ux16:
       case Iop_QSub8Sx16:
@@ -2088,7 +2546,12 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_Avg8Sx16:
       case Iop_QAdd8Ux16:
       case Iop_QAdd8Sx16:
+      case Iop_QSal8x16:
+      case Iop_QShl8x16:
       case Iop_Add8x16:
+      case Iop_Mul8x16:
+      case Iop_PolynomialMul8x16:
+      case Iop_PolynomialMulAdd8x16:
          return binary8Ix16(mce, vatom1, vatom2);
 
       case Iop_QSub16Ux8:
@@ -2108,7 +2571,12 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_Avg16Sx8:
       case Iop_QAdd16Ux8:
       case Iop_QAdd16Sx8:
+      case Iop_QSal16x8:
+      case Iop_QShl16x8:
       case Iop_Add16x8:
+      case Iop_QDMulHi16Sx8:
+      case Iop_QRDMulHi16Sx8:
+      case Iop_PolynomialMulAdd16x8:
          return binary16Ix8(mce, vatom1, vatom2);
 
       case Iop_Sub32x4:
@@ -2119,6 +2587,8 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_QAdd32Ux4:
       case Iop_QSub32Sx4:
       case Iop_QSub32Ux4:
+      case Iop_QSal32x4:
+      case Iop_QShl32x4:
       case Iop_Avg32Ux4:
       case Iop_Avg32Sx4:
       case Iop_Add32x4:
@@ -2126,12 +2596,36 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_Max32Sx4:
       case Iop_Min32Ux4:
       case Iop_Min32Sx4:
+      case Iop_Mul32x4:
+      case Iop_QDMulHi32Sx4:
+      case Iop_QRDMulHi32Sx4:
+      case Iop_PolynomialMulAdd32x4:
          return binary32Ix4(mce, vatom1, vatom2);
 
       case Iop_Sub64x2:
       case Iop_Add64x2:
-         return binary64Ix2(mce, vatom1, vatom2);
+      case Iop_Max64Sx2:
+      case Iop_Max64Ux2:
+      case Iop_Min64Sx2:
+      case Iop_Min64Ux2:
+      case Iop_CmpEQ64x2:
+      case Iop_CmpGT64Sx2:
+      case Iop_CmpGT64Ux2:
+      case Iop_QSal64x2:
+      case Iop_QShl64x2:
+      case Iop_QAdd64Ux2:
+      case Iop_QAdd64Sx2:
+      case Iop_QSub64Ux2:
+      case Iop_QSub64Sx2:
+      case Iop_PolynomialMulAdd64x2:
+      case Iop_CipherV128:
+      case Iop_CipherLV128:
+      case Iop_NCipherV128:
+      case Iop_NCipherLV128:
+        return binary64Ix2(mce, vatom1, vatom2);
 
+      case Iop_QNarrowBin64Sto32Sx4:
+      case Iop_QNarrowBin64Uto32Ux4:
       case Iop_QNarrowBin32Sto16Sx8:
       case Iop_QNarrowBin32Uto16Ux8:
       case Iop_QNarrowBin32Sto16Ux8:
@@ -2150,7 +2644,7 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_CmpEQ64Fx2:
       case Iop_CmpUN64Fx2:
       case Iop_Add64Fx2:
-         return binary64Fx2(mce, vatom1, vatom2);
+         return binary64Fx2(mce, vatom1, vatom2);      
 
       case Iop_Sub64F0x2:
       case Iop_Mul64F0x2:
@@ -2162,7 +2656,7 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_CmpEQ64F0x2:
       case Iop_CmpUN64F0x2:
       case Iop_Add64F0x2:
-         return binary64F0x2(mce, vatom1, vatom2);
+         return binary64F0x2(mce, vatom1, vatom2);      
 
       case Iop_Sub32Fx4:
       case Iop_Mul32Fx4:
@@ -2176,7 +2670,21 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_CmpGT32Fx4:
       case Iop_CmpGE32Fx4:
       case Iop_Add32Fx4:
-         return binary32Fx4(mce, vatom1, vatom2);
+      case Iop_Recps32Fx4:
+      case Iop_Rsqrts32Fx4:
+         return binary32Fx4(mce, vatom1, vatom2);      
+
+      case Iop_Sub32Fx2:
+      case Iop_Mul32Fx2:
+      case Iop_Min32Fx2:
+      case Iop_Max32Fx2:
+      case Iop_CmpEQ32Fx2:
+      case Iop_CmpGT32Fx2:
+      case Iop_CmpGE32Fx2:
+      case Iop_Add32Fx2:
+      case Iop_Recps32Fx2:
+      case Iop_Rsqrts32Fx2:
+         return binary32Fx2(mce, vatom1, vatom2);      
 
       case Iop_Sub32F0x4:
       case Iop_Mul32F0x4:
@@ -2188,7 +2696,64 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_CmpEQ32F0x4:
       case Iop_CmpUN32F0x4:
       case Iop_Add32F0x4:
-         return binary32F0x4(mce, vatom1, vatom2);
+         return binary32F0x4(mce, vatom1, vatom2);      
+
+      case Iop_QShlN8Sx16:
+      case Iop_QShlN8x16:
+      case Iop_QSalN8x16:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast8x16(mce, vatom1);
+
+      case Iop_QShlN16Sx8:
+      case Iop_QShlN16x8:
+      case Iop_QSalN16x8:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast16x8(mce, vatom1);
+
+      case Iop_QShlN32Sx4:
+      case Iop_QShlN32x4:
+      case Iop_QSalN32x4:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast32x4(mce, vatom1);
+
+      case Iop_QShlN64Sx2:
+      case Iop_QShlN64x2:
+      case Iop_QSalN64x2:
+         //complainIfUndefined(mce, atom2, NULL);
+         return mkPCast32x4(mce, vatom1);
+
+      case Iop_Mull32Sx2:
+      case Iop_Mull32Ux2:
+      case Iop_QDMulLong32Sx2:
+         return vectorWidenI64(mce, Iop_Widen32Sto64x2,
+                                    mkUifU64(mce, vatom1, vatom2));
+
+      case Iop_Mull16Sx4:
+      case Iop_Mull16Ux4:
+      case Iop_QDMulLong16Sx4:
+         return vectorWidenI64(mce, Iop_Widen16Sto32x4,
+                                    mkUifU64(mce, vatom1, vatom2));
+
+      case Iop_Mull8Sx8:
+      case Iop_Mull8Ux8:
+      case Iop_PolynomialMull8x8:
+         return vectorWidenI64(mce, Iop_Widen8Sto16x8,
+                                    mkUifU64(mce, vatom1, vatom2));
+
+      case Iop_PwAdd32x4:
+         return mkPCast32x4(mce,
+               assignNew('V', mce, Ity_V128, binop(op, mkPCast32x4(mce, vatom1),
+                     mkPCast32x4(mce, vatom2))));
+
+      case Iop_PwAdd16x8:
+         return mkPCast16x8(mce,
+               assignNew('V', mce, Ity_V128, binop(op, mkPCast16x8(mce, vatom1),
+                     mkPCast16x8(mce, vatom2))));
+
+      case Iop_PwAdd8x16:
+         return mkPCast8x16(mce,
+               assignNew('V', mce, Ity_V128, binop(op, mkPCast8x16(mce, vatom1),
+                     mkPCast8x16(mce, vatom2))));
 
       /* V128-bit data-steering */
       case Iop_SetV128lo32:
@@ -2202,16 +2767,47 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_InterleaveHI32x4:
       case Iop_InterleaveHI16x8:
       case Iop_InterleaveHI8x16:
+      case Iop_CatOddLanes8x16:
+      case Iop_CatOddLanes16x8:
+      case Iop_CatOddLanes32x4:
+      case Iop_CatEvenLanes8x16:
+      case Iop_CatEvenLanes16x8:
+      case Iop_CatEvenLanes32x4:
+      case Iop_InterleaveOddLanes8x16:
+      case Iop_InterleaveOddLanes16x8:
+      case Iop_InterleaveOddLanes32x4:
+      case Iop_InterleaveEvenLanes8x16:
+      case Iop_InterleaveEvenLanes16x8:
+      case Iop_InterleaveEvenLanes32x4:
          return assignNew('V', mce, Ity_V128, binop(op, vatom1, vatom2));
+
+      case Iop_GetElem8x16:
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_I8, binop(op, vatom1, atom2));
+      case Iop_GetElem16x8:
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_I16, binop(op, vatom1, atom2));
+      case Iop_GetElem32x4:
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_I32, binop(op, vatom1, atom2));
+      case Iop_GetElem64x2:
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_I64, binop(op, vatom1, atom2));
 
      /* Perm8x16: rearrange values in left arg using steering values
         from right arg.  So rearrange the vbits in the same way but
-        pessimise wrt steering values. */
+        pessimise wrt steering values.  Perm32x4 ditto. */
       case Iop_Perm8x16:
          return mkUifUV128(
                    mce,
                    assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
                    mkPCast8x16(mce, vatom2)
+                );
+      case Iop_Perm32x4:
+         return mkUifUV128(
+                   mce,
+                   assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
+                   mkPCast32x4(mce, vatom2)
                 );
 
      /* These two take the lower half of each 16-bit lane, sign/zero
@@ -2227,7 +2823,7 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          at = binary16Ix8(mce,vatom1,vatom2);
          at = assignNew('V', mce, Ity_V128, binop(Iop_ShlN32x4, at, mkU8(16)));
          at = assignNew('V', mce, Ity_V128, binop(Iop_SarN32x4, at, mkU8(16)));
-         return at;
+	 return at;
       }
 
       /* Same deal as Iop_MullEven16{S,U}x8 */
@@ -2237,6 +2833,16 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          at = binary8Ix16(mce,vatom1,vatom2);
          at = assignNew('V', mce, Ity_V128, binop(Iop_ShlN16x8, at, mkU8(8)));
          at = assignNew('V', mce, Ity_V128, binop(Iop_SarN16x8, at, mkU8(8)));
+	 return at;
+      }
+
+      /* Same deal as Iop_MullEven16{S,U}x8 */
+      case Iop_MullEven32Ux4:
+      case Iop_MullEven32Sx4: {
+         IRAtom* at;
+         at = binary32Ix4(mce,vatom1,vatom2);
+         at = assignNew('V', mce, Ity_V128, binop(Iop_ShlN64x2, at, mkU8(32)));
+         at = assignNew('V', mce, Ity_V128, binop(Iop_SarN64x2, at, mkU8(32)));
          return at;
       }
 
@@ -2244,9 +2850,10 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          32x4 -> 16x8 laneage, discarding the upper half of each lane.
          Simply apply same op to the V bits, since this really no more
          than a data steering operation. */
-      case Iop_NarrowBin32to16x8:
-      case Iop_NarrowBin16to8x16:
-         return assignNew('V', mce, Ity_V128,
+      case Iop_NarrowBin32to16x8: 
+      case Iop_NarrowBin16to8x16: 
+      case Iop_NarrowBin64to32x4:
+         return assignNew('V', mce, Ity_V128, 
                                     binop(op, vatom1, vatom2));
 
       case Iop_ShrV128:
@@ -2254,20 +2861,58 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          /* Same scheme as with all other shifts.  Note: 10 Nov 05:
             this is wrong now, scalar shifts are done properly lazily.
             Vector shifts should be fixed too. */
-         // Taintgrind: Checked in do_shadow_WRTMP
-//         complainIfTainted(mce, atom2);
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2));
+
+      /* SHA Iops */
+      case Iop_SHA256:
+      case Iop_SHA512:
+         //complainIfUndefined(mce, atom2, NULL);
          return assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2));
 
       /* I128-bit data-steering */
       case Iop_64HLto128:
          return assignNew('V', mce, Ity_I128, binop(op, vatom1, vatom2));
 
+      /* V256-bit SIMD */
+
+      case Iop_Add64Fx4:
+      case Iop_Sub64Fx4:
+      case Iop_Mul64Fx4:
+      case Iop_Div64Fx4:
+      case Iop_Max64Fx4:
+      case Iop_Min64Fx4:
+         return binary64Fx4(mce, vatom1, vatom2);
+
+      case Iop_Add32Fx8:
+      case Iop_Sub32Fx8:
+      case Iop_Mul32Fx8:
+      case Iop_Div32Fx8:
+      case Iop_Max32Fx8:
+      case Iop_Min32Fx8:
+         return binary32Fx8(mce, vatom1, vatom2);
+
+      /* V256-bit data-steering */
+      case Iop_V128HLtoV256:
+         return assignNew('V', mce, Ity_V256, binop(op, vatom1, vatom2));
+
       /* Scalar floating point */
+
+      case Iop_F32toI64S:
+      case Iop_F32toI64U:
+         /* I32(rm) x F32 -> I64 */
+         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+
+      case Iop_I64StoF32:
+         /* I32(rm) x I64 -> F32 */
+         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
 
       case Iop_RoundF64toInt:
       case Iop_RoundF64toF32:
       case Iop_F64toI64S:
+      case Iop_F64toI64U:
       case Iop_I64StoF64:
+      case Iop_I64UtoF64:
       case Iop_SinF64:
       case Iop_CosF64:
       case Iop_TanF64:
@@ -2276,17 +2921,120 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          /* I32(rm) x I64/F64 -> I64/F64 */
          return mkLazy2(mce, Ity_I64, vatom1, vatom2);
 
-      case Iop_F64toI32S:
+      case Iop_ShlD64:
+      case Iop_ShrD64:
+      case Iop_RoundD64toInt:
+         /* I32(rm) x D64 -> D64 */
+         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+
+      case Iop_ShlD128:
+      case Iop_ShrD128:
+      case Iop_RoundD128toInt:
+         /* I32(rm) x D128 -> D128 */
+         return mkLazy2(mce, Ity_I128, vatom1, vatom2);
+
+      case Iop_D64toI64S:
+      case Iop_D64toI64U:
+      case Iop_I64StoD64:
+      case Iop_I64UtoD64:
+         /* I32(rm) x I64/D64 -> D64/I64 */
+         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+
+      case Iop_F32toD32:
+      case Iop_F64toD32:
+      case Iop_F128toD32:
+      case Iop_D32toF32:
+      case Iop_D64toF32:
+      case Iop_D128toF32:
+         /* I32(rm) x F32/F64/F128/D32/D64/D128 -> D32/F32 */
+         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+
+      case Iop_F32toD64:
+      case Iop_F64toD64:
+      case Iop_F128toD64:
+      case Iop_D32toF64:
+      case Iop_D64toF64:
+      case Iop_D128toF64:
+         /* I32(rm) x F32/F64/F128/D32/D64/D128 -> D64/F64 */
+         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+
+      case Iop_F32toD128:
+      case Iop_F64toD128:
+      case Iop_F128toD128:
+      case Iop_D32toF128:
+      case Iop_D64toF128:
+      case Iop_D128toF128:
+         /* I32(rm) x F32/F64/F128/D32/D64/D128 -> D128/F128 */
+         return mkLazy2(mce, Ity_I128, vatom1, vatom2);
+
+      case Iop_RoundF32toInt:
+      case Iop_SqrtF32:
+         /* I32(rm) x I32/F32 -> I32/F32 */
+         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+
+      case Iop_SqrtF128:
+         /* I32(rm) x F128 -> F128 */
+         return mkLazy2(mce, Ity_I128, vatom1, vatom2);
+
+      case Iop_I32StoF32:
+      case Iop_I32UtoF32:
+      case Iop_F32toI32S:
+      case Iop_F32toI32U:
+         /* First arg is I32 (rounding mode), second is F32/I32 (data). */
+         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+
+      case Iop_F128toI32S: /* IRRoundingMode(I32) x F128 -> signed I32  */
+      case Iop_F128toI32U: /* IRRoundingMode(I32) x F128 -> unsigned I32  */
+      case Iop_F128toF32:  /* IRRoundingMode(I32) x F128 -> F32         */
+      case Iop_D128toI32S: /* IRRoundingMode(I32) x D128 -> signed I32  */
+      case Iop_D128toI32U: /* IRRoundingMode(I32) x D128 -> unsigned I32  */
+         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+
+      case Iop_F128toI64S: /* IRRoundingMode(I32) x F128 -> signed I64  */
+      case Iop_F128toI64U: /* IRRoundingMode(I32) x F128 -> unsigned I64  */
+      case Iop_F128toF64:  /* IRRoundingMode(I32) x F128 -> F64         */
+      case Iop_D128toD64:  /* IRRoundingMode(I64) x D128 -> D64 */
+      case Iop_D128toI64S: /* IRRoundingMode(I64) x D128 -> signed I64  */
+      case Iop_D128toI64U: /* IRRoundingMode(I32) x D128 -> unsigned I64  */
+         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+
+      case Iop_F64HLtoF128:
+      case Iop_D64HLtoD128:
+         return assignNew('V', mce, Ity_I128,
+                          binop(Iop_64HLto128, vatom1, vatom2));
+
       case Iop_F64toI32U:
+      case Iop_F64toI32S:
       case Iop_F64toF32:
-         /* First arg is I32 (rounding mode), second is F64 (data). */
+      case Iop_I64UtoF32:
+      case Iop_D64toI32U:
+      case Iop_D64toI32S:
+         /* First arg is I32 (rounding mode), second is F64/D64 (data). */
+         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+
+      case Iop_D64toD32:
+         /* First arg is I32 (rounding mode), second is D64 (data). */
          return mkLazy2(mce, Ity_I32, vatom1, vatom2);
 
       case Iop_F64toI16S:
          /* First arg is I32 (rounding mode), second is F64 (data). */
          return mkLazy2(mce, Ity_I16, vatom1, vatom2);
 
+      case Iop_InsertExpD64:
+         /*  I64 x I64 -> D64 */
+         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+
+      case Iop_InsertExpD128:
+         /*  I64 x I128 -> D128 */
+         return mkLazy2(mce, Ity_I128, vatom1, vatom2);
+
+      case Iop_CmpF32:
       case Iop_CmpF64:
+      case Iop_CmpF128:
+      case Iop_CmpD64:
+      case Iop_CmpD128:
+      case Iop_CmpExpD64:
+      case Iop_CmpExpD128:
          return mkLazy2(mce, Ity_I32, vatom1, vatom2);
 
       /* non-FP after here */
@@ -2299,30 +3047,36 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_DivModS128to64:
          return mkLazy2(mce, Ity_I128, vatom1, vatom2);
 
+      case Iop_8HLto16:
+         return assignNew('V', mce, Ity_I16, binop(op, vatom1, vatom2));
       case Iop_16HLto32:
          return assignNew('V', mce, Ity_I32, binop(op, vatom1, vatom2));
       case Iop_32HLto64:
          return assignNew('V', mce, Ity_I64, binop(op, vatom1, vatom2));
 
+      case Iop_DivModS64to64:
       case Iop_MullS64:
       case Iop_MullU64: {
          IRAtom* vLo64 = mkLeft64(mce, mkUifU64(mce, vatom1,vatom2));
          IRAtom* vHi64 = mkPCastTo(mce, Ity_I64, vLo64);
-         return assignNew('V', mce, Ity_I128, binop(Iop_64HLto128, vHi64, vLo64));
+         return assignNew('V', mce, Ity_I128,
+                          binop(Iop_64HLto128, vHi64, vLo64));
       }
 
       case Iop_MullS32:
       case Iop_MullU32: {
          IRAtom* vLo32 = mkLeft32(mce, mkUifU32(mce, vatom1,vatom2));
          IRAtom* vHi32 = mkPCastTo(mce, Ity_I32, vLo32);
-         return assignNew('V', mce, Ity_I64, binop(Iop_32HLto64, vHi32, vLo32));
+         return assignNew('V', mce, Ity_I64,
+                          binop(Iop_32HLto64, vHi32, vLo32));
       }
 
       case Iop_MullS16:
       case Iop_MullU16: {
          IRAtom* vLo16 = mkLeft16(mce, mkUifU16(mce, vatom1,vatom2));
          IRAtom* vHi16 = mkPCastTo(mce, Ity_I16, vLo16);
-         return assignNew('V', mce, Ity_I32, binop(Iop_16HLto32, vHi16, vLo16));
+         return assignNew('V', mce, Ity_I32,
+                          binop(Iop_16HLto32, vHi16, vLo16));
       }
 
       case Iop_MullS8:
@@ -2332,25 +3086,30 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          return assignNew('V', mce, Ity_I16, binop(Iop_8HLto16, vHi8, vLo8));
       }
 
+      case Iop_Sad8Ux4: /* maybe we could do better?  ftm, do mkLazy2. */
       case Iop_DivS32:
       case Iop_DivU32:
+      case Iop_DivU32E:
+      case Iop_DivS32E:
+      case Iop_QAdd32S: /* could probably do better */
+      case Iop_QSub32S: /* could probably do better */
          return mkLazy2(mce, Ity_I32, vatom1, vatom2);
 
       case Iop_DivS64:
       case Iop_DivU64:
+      case Iop_DivS64E:
+      case Iop_DivU64E:
          return mkLazy2(mce, Ity_I64, vatom1, vatom2);
 
       case Iop_Add32:
-         // Taintgrind
-//         complainIfUndefined(mce, atom2);
-         if (mce->bogusLiterals)
-            return expensiveAddSub(mce,True,Ity_I32,
+         if (mce->bogusLiterals || mce->useLLVMworkarounds)
+            return expensiveAddSub(mce,True,Ity_I32, 
                                    vatom1,vatom2, atom1,atom2);
          else
             goto cheap_AddSub32;
       case Iop_Sub32:
          if (mce->bogusLiterals)
-            return expensiveAddSub(mce,False,Ity_I32,
+            return expensiveAddSub(mce,False,Ity_I32, 
                                    vatom1,vatom2, atom1,atom2);
          else
             goto cheap_AddSub32;
@@ -2366,14 +3125,14 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          return doCmpORD(mce, op, vatom1,vatom2, atom1,atom2);
 
       case Iop_Add64:
-         if (mce->bogusLiterals)
-            return expensiveAddSub(mce,True,Ity_I64,
+         if (mce->bogusLiterals || mce->useLLVMworkarounds)
+            return expensiveAddSub(mce,True,Ity_I64, 
                                    vatom1,vatom2, atom1,atom2);
          else
             goto cheap_AddSub64;
       case Iop_Sub64:
          if (mce->bogusLiterals)
-            return expensiveAddSub(mce,False,Ity_I64,
+            return expensiveAddSub(mce,False,Ity_I64, 
                                    vatom1,vatom2, atom1,atom2);
          else
             goto cheap_AddSub64;
@@ -2385,40 +3144,50 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_Mul16:
       case Iop_Add16:
       case Iop_Sub16:
-         // Taintgrind
-//         complainIfUndefined(mce, atom2);
          return mkLeft16(mce, mkUifU16(mce, vatom1,vatom2));
 
+      case Iop_Mul8:
       case Iop_Sub8:
       case Iop_Add8:
-         // Taintgrind
-//         complainIfUndefined(mce, atom2);
          return mkLeft8(mce, mkUifU8(mce, vatom1,vatom2));
 
-      case Iop_CmpEQ64:
+      case Iop_CmpEQ64: 
       case Iop_CmpNE64:
          if (mce->bogusLiterals)
-            return expensiveCmpEQorNE(mce,Ity_I64, vatom1,vatom2, atom1,atom2 );
+            goto expensive_cmp64;
          else
             goto cheap_cmp64;
+
+      expensive_cmp64:
+      case Iop_ExpCmpNE64:
+         return expensiveCmpEQorNE(mce,Ity_I64, vatom1,vatom2, atom1,atom2 );
+
       cheap_cmp64:
-      case Iop_CmpLE64S: case Iop_CmpLE64U:
+      case Iop_CmpLE64S: case Iop_CmpLE64U: 
       case Iop_CmpLT64U: case Iop_CmpLT64S:
          return mkPCastTo(mce, Ity_I1, mkUifU64(mce, vatom1,vatom2));
 
-      case Iop_CmpEQ32:
+      case Iop_CmpEQ32: 
       case Iop_CmpNE32:
          if (mce->bogusLiterals)
-            return expensiveCmpEQorNE(mce,Ity_I32, vatom1,vatom2, atom1,atom2 );
+            goto expensive_cmp32;
          else
             goto cheap_cmp32;
+
+      expensive_cmp32:
+      case Iop_ExpCmpNE32:
+         return expensiveCmpEQorNE(mce,Ity_I32, vatom1,vatom2, atom1,atom2 );
+
       cheap_cmp32:
-      case Iop_CmpLE32S: case Iop_CmpLE32U:
+      case Iop_CmpLE32S: case Iop_CmpLE32U: 
       case Iop_CmpLT32U: case Iop_CmpLT32S:
          return mkPCastTo(mce, Ity_I1, mkUifU32(mce, vatom1,vatom2));
 
       case Iop_CmpEQ16: case Iop_CmpNE16:
          return mkPCastTo(mce, Ity_I1, mkUifU16(mce, vatom1,vatom2));
+
+      case Iop_ExpCmpNE16:
+         return expensiveCmpEQorNE(mce,Ity_I16, vatom1,vatom2, atom1,atom2 );
 
       case Iop_CmpEQ8: case Iop_CmpNE8:
          return mkPCastTo(mce, Ity_I1, mkUifU8(mce, vatom1,vatom2));
@@ -2440,45 +3209,51 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
       case Iop_Shl16: case Iop_Shr16: case Iop_Sar16:
          return scalarShift( mce, Ity_I16, op, vatom1,vatom2, atom1,atom2 );
 
-      case Iop_Shl8: case Iop_Shr8:
+      case Iop_Shl8: case Iop_Shr8: case Iop_Sar8:
          return scalarShift( mce, Ity_I8, op, vatom1,vatom2, atom1,atom2 );
 
+      case Iop_AndV256:
+         uifu = mkUifUV256; difd = mkDifDV256; 
+         and_or_ty = Ity_V256; improve = mkImproveANDV256; goto do_And_Or;
       case Iop_AndV128:
-         uifu = mkUifUV128; difd = mkDifDV128;
+         uifu = mkUifUV128; difd = mkDifDV128; 
          and_or_ty = Ity_V128; improve = mkImproveANDV128; goto do_And_Or;
       case Iop_And64:
-         uifu = mkUifU64; difd = mkDifD64;
+         uifu = mkUifU64; difd = mkDifD64; 
          and_or_ty = Ity_I64; improve = mkImproveAND64; goto do_And_Or;
       case Iop_And32:
-         uifu = mkUifU32; difd = mkDifD32;
+         uifu = mkUifU32; difd = mkDifD32; 
          and_or_ty = Ity_I32; improve = mkImproveAND32; goto do_And_Or;
       case Iop_And16:
-         uifu = mkUifU16; difd = mkDifD16;
+         uifu = mkUifU16; difd = mkDifD16; 
          and_or_ty = Ity_I16; improve = mkImproveAND16; goto do_And_Or;
       case Iop_And8:
-         uifu = mkUifU8; difd = mkDifD8;
+         uifu = mkUifU8; difd = mkDifD8; 
          and_or_ty = Ity_I8; improve = mkImproveAND8; goto do_And_Or;
 
+      case Iop_OrV256:
+         uifu = mkUifUV256; difd = mkDifDV256; 
+         and_or_ty = Ity_V256; improve = mkImproveORV256; goto do_And_Or;
       case Iop_OrV128:
-         uifu = mkUifUV128; difd = mkDifDV128;
+         uifu = mkUifUV128; difd = mkDifDV128; 
          and_or_ty = Ity_V128; improve = mkImproveORV128; goto do_And_Or;
       case Iop_Or64:
-         uifu = mkUifU64; difd = mkDifD64;
+         uifu = mkUifU64; difd = mkDifD64; 
          and_or_ty = Ity_I64; improve = mkImproveOR64; goto do_And_Or;
       case Iop_Or32:
-         uifu = mkUifU32; difd = mkDifD32;
+         uifu = mkUifU32; difd = mkDifD32; 
          and_or_ty = Ity_I32; improve = mkImproveOR32; goto do_And_Or;
       case Iop_Or16:
-         uifu = mkUifU16; difd = mkDifD16;
+         uifu = mkUifU16; difd = mkDifD16; 
          and_or_ty = Ity_I16; improve = mkImproveOR16; goto do_And_Or;
       case Iop_Or8:
-         uifu = mkUifU8; difd = mkDifD8;
+         uifu = mkUifU8; difd = mkDifD8; 
          and_or_ty = Ity_I8; improve = mkImproveOR8; goto do_And_Or;
 
       do_And_Or:
          return
          assignNew(
-            'V', mce,
+            'V', mce, 
             and_or_ty,
             difd(mce, uifu(mce, vatom1, vatom2),
                       difd(mce, improve(mce, atom1, vatom1),
@@ -2494,6 +3269,84 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
          return mkUifU64(mce, vatom1, vatom2);
       case Iop_XorV128:
          return mkUifUV128(mce, vatom1, vatom2);
+      case Iop_XorV256:
+         return mkUifUV256(mce, vatom1, vatom2);
+
+      /* V256-bit SIMD */
+
+      case Iop_ShrN16x16:
+      case Iop_ShrN32x8:
+      case Iop_ShrN64x4:
+      case Iop_SarN16x16:
+      case Iop_SarN32x8:
+      case Iop_ShlN16x16:
+      case Iop_ShlN32x8:
+      case Iop_ShlN64x4:
+         /* Same scheme as with all other shifts.  Note: 22 Oct 05:
+            this is wrong now, scalar shifts are done properly lazily.
+            Vector shifts should be fixed too. */
+         //complainIfUndefined(mce, atom2, NULL);
+         return assignNew('V', mce, Ity_V256, binop(op, vatom1, atom2));
+
+      case Iop_QSub8Ux32:
+      case Iop_QSub8Sx32:
+      case Iop_Sub8x32:
+      case Iop_Min8Ux32:
+      case Iop_Min8Sx32:
+      case Iop_Max8Ux32:
+      case Iop_Max8Sx32:
+      case Iop_CmpGT8Sx32:
+      case Iop_CmpEQ8x32:
+      case Iop_Avg8Ux32:
+      case Iop_QAdd8Ux32:
+      case Iop_QAdd8Sx32:
+      case Iop_Add8x32:
+         return binary8Ix32(mce, vatom1, vatom2);
+
+      case Iop_QSub16Ux16:
+      case Iop_QSub16Sx16:
+      case Iop_Sub16x16:
+      case Iop_Mul16x16:
+      case Iop_MulHi16Sx16:
+      case Iop_MulHi16Ux16:
+      case Iop_Min16Sx16:
+      case Iop_Min16Ux16:
+      case Iop_Max16Sx16:
+      case Iop_Max16Ux16:
+      case Iop_CmpGT16Sx16:
+      case Iop_CmpEQ16x16:
+      case Iop_Avg16Ux16:
+      case Iop_QAdd16Ux16:
+      case Iop_QAdd16Sx16:
+      case Iop_Add16x16:
+         return binary16Ix16(mce, vatom1, vatom2);
+
+      case Iop_Sub32x8:
+      case Iop_CmpGT32Sx8:
+      case Iop_CmpEQ32x8:
+      case Iop_Add32x8:
+      case Iop_Max32Ux8:
+      case Iop_Max32Sx8:
+      case Iop_Min32Ux8:
+      case Iop_Min32Sx8:
+      case Iop_Mul32x8:
+         return binary32Ix8(mce, vatom1, vatom2);
+
+      case Iop_Sub64x4:
+      case Iop_Add64x4:
+      case Iop_CmpEQ64x4:
+      case Iop_CmpGT64Sx4:
+         return binary64Ix4(mce, vatom1, vatom2);
+
+     /* Perm32x8: rearrange values in left arg using steering values
+        from right arg.  So rearrange the vbits in the same way but
+        pessimise wrt steering values. */
+      case Iop_Perm32x8:
+         return mkUifUV256(
+                   mce,
+                   assignNew('V', mce, Ity_V256, binop(op, vatom1, atom2)),
+                   mkPCast32x8(mce, vatom2)
+                );
 
       default:
          ppIROp(op);
@@ -2501,10 +3354,599 @@ IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
    }
 }
 
-static
+
+//static
+//IRAtom* expr2vbits_Binop ( MCEnv* mce,   //2080
+//                           IROp op,
+//                           IRAtom* atom1, IRAtom* atom2 )
+//{
+//   IRType  and_or_ty;
+//   IRAtom* (*uifu)    (MCEnv*, IRAtom*, IRAtom*);
+//   IRAtom* (*difd)    (MCEnv*, IRAtom*, IRAtom*);
+//   IRAtom* (*improve) (MCEnv*, IRAtom*, IRAtom*);
+//
+////   VG_(printf)("expr2vbits_Binop\n");
+////   ppIRExpr(atom1); VG_(printf)("\n");
+//
+//   IRAtom* vatom1 = atom2vbits( mce, atom1 );
+//   IRAtom* vatom2 = atom2vbits( mce, atom2 );
+//
+//   tl_assert(isOriginalAtom(mce,atom1));
+//   tl_assert(isOriginalAtom(mce,atom2));
+//   tl_assert(isShadowAtom(mce,vatom1));
+//   tl_assert(isShadowAtom(mce,vatom2));
+//   tl_assert(sameKindedAtoms(atom1,vatom1));
+//   tl_assert(sameKindedAtoms(atom2,vatom2));
+//   switch (op) {
+//
+//      /* 64-bit SIMD */
+//
+//      case Iop_ShrN16x4:
+//      case Iop_ShrN32x2:
+//      case Iop_SarN8x8:
+//      case Iop_SarN16x4:
+//      case Iop_SarN32x2:
+//      case Iop_ShlN16x4:
+//      case Iop_ShlN32x2:
+//      case Iop_ShlN8x8:
+//         /* Same scheme as with all other shifts. */
+//         // Taintgrind: Checked in do_shadow_WRTMP
+////         complainIfTainted(mce, atom2);
+//         return assignNew('V', mce, Ity_I64, binop(op, vatom1, atom2));
+//
+//      case Iop_QNarrowBin32Sto16Sx4:
+//      case Iop_QNarrowBin16Sto8Sx8:
+//      case Iop_QNarrowBin16Sto8Ux8:
+//         return vectorNarrowBin64(mce, op, vatom1, vatom2);
+//
+//      case Iop_Min8Ux8:
+//      case Iop_Max8Ux8:
+//      case Iop_Avg8Ux8:
+//      case Iop_QSub8Sx8:
+//      case Iop_QSub8Ux8:
+//      case Iop_Sub8x8:
+//      case Iop_CmpGT8Sx8:
+//      case Iop_CmpEQ8x8:
+//      case Iop_QAdd8Sx8:
+//      case Iop_QAdd8Ux8:
+//      case Iop_Add8x8:
+//         return binary8Ix8(mce, vatom1, vatom2);
+//
+//      case Iop_Min16Sx4:
+//      case Iop_Max16Sx4:
+//      case Iop_Avg16Ux4:
+//      case Iop_QSub16Ux4:
+//      case Iop_QSub16Sx4:
+//      case Iop_Sub16x4:
+//      case Iop_Mul16x4:
+//      case Iop_MulHi16Sx4:
+//      case Iop_MulHi16Ux4:
+//      case Iop_CmpGT16Sx4:
+//      case Iop_CmpEQ16x4:
+//      case Iop_QAdd16Sx4:
+//      case Iop_QAdd16Ux4:
+//      case Iop_Add16x4:
+//         return binary16Ix4(mce, vatom1, vatom2);
+//
+//      case Iop_Sub32x2:
+//      case Iop_Mul32x2:
+//      case Iop_CmpGT32Sx2:
+//      case Iop_CmpEQ32x2:
+//      case Iop_Add32x2:
+//         return binary32Ix2(mce, vatom1, vatom2);
+//
+//      /* 64-bit data-steering */
+//      case Iop_InterleaveLO32x2:
+//      case Iop_InterleaveLO16x4:
+//      case Iop_InterleaveLO8x8:
+//      case Iop_InterleaveHI32x2:
+//      case Iop_InterleaveHI16x4:
+//      case Iop_InterleaveHI8x8:
+//      case Iop_CatOddLanes16x4:
+//      case Iop_CatEvenLanes16x4:
+//         return assignNew('V', mce, Ity_I64, binop(op, vatom1, vatom2));
+//
+//      /* Perm8x8: rearrange values in left arg using steering values
+//        from right arg.  So rearrange the vbits in the same way but
+//        pessimise wrt steering values. */
+//      case Iop_Perm8x8:
+//         return mkUifU64(
+//                   mce,
+//                   assignNew('V', mce, Ity_I64, binop(op, vatom1, atom2)),
+//                   mkPCast8x8(mce, vatom2)
+//                );
+//
+//      /* V128-bit SIMD */
+//
+//      case Iop_ShrN16x8:
+//      case Iop_ShrN32x4:
+//      case Iop_ShrN64x2:
+//      case Iop_SarN16x8:
+//      case Iop_SarN32x4:
+//      case Iop_ShlN16x8:
+//      case Iop_ShlN32x4:
+//      case Iop_ShlN64x2:
+//      case Iop_ShlN8x16:
+//      case Iop_SarN8x16:
+//         /* Same scheme as with all other shifts.  Note: 22 Oct 05:
+//            this is wrong now, scalar shifts are done properly lazily.
+//            Vector shifts should be fixed too. */
+//         // Taintgrind: Checked in do_shadow_WRTMP
+////         complainIfTainted(mce, atom2);
+//         return assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2));
+//
+//      /* V x V shifts/rotates are done using the standard lazy scheme. */
+//      case Iop_Shl8x16:
+//      case Iop_Shr8x16:
+//      case Iop_Sar8x16:
+//      case Iop_Rol8x16:
+//         return mkUifUV128(mce,
+//                   assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
+//                   mkPCast8x16(mce,vatom2)
+//                );
+//      case Iop_Shl16x8:
+//      case Iop_Shr16x8:
+//      case Iop_Sar16x8:
+//      case Iop_Rol16x8:
+//         return mkUifUV128(mce,
+//                   assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
+//                   mkPCast16x8(mce,vatom2)
+//                );
+//
+//      case Iop_Shl32x4:
+//      case Iop_Shr32x4:
+//      case Iop_Sar32x4:
+//      case Iop_Rol32x4:
+//         return mkUifUV128(mce,
+//                   assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
+//                   mkPCast32x4(mce,vatom2)
+//                );
+//
+//      case Iop_QSub8Ux16:
+//      case Iop_QSub8Sx16:
+//      case Iop_Sub8x16:
+//      case Iop_Min8Ux16:
+//      case Iop_Min8Sx16:
+//      case Iop_Max8Ux16:
+//      case Iop_Max8Sx16:
+//      case Iop_CmpGT8Sx16:
+//      case Iop_CmpGT8Ux16:
+//      case Iop_CmpEQ8x16:
+//      case Iop_Avg8Ux16:
+//      case Iop_Avg8Sx16:
+//      case Iop_QAdd8Ux16:
+//      case Iop_QAdd8Sx16:
+//      case Iop_Add8x16:
+//         return binary8Ix16(mce, vatom1, vatom2);
+//
+//      case Iop_QSub16Ux8:
+//      case Iop_QSub16Sx8:
+//      case Iop_Sub16x8:
+//      case Iop_Mul16x8:
+//      case Iop_MulHi16Sx8:
+//      case Iop_MulHi16Ux8:
+//      case Iop_Min16Sx8:
+//      case Iop_Min16Ux8:
+//      case Iop_Max16Sx8:
+//      case Iop_Max16Ux8:
+//      case Iop_CmpGT16Sx8:
+//      case Iop_CmpGT16Ux8:
+//      case Iop_CmpEQ16x8:
+//      case Iop_Avg16Ux8:
+//      case Iop_Avg16Sx8:
+//      case Iop_QAdd16Ux8:
+//      case Iop_QAdd16Sx8:
+//      case Iop_Add16x8:
+//         return binary16Ix8(mce, vatom1, vatom2);
+//
+//      case Iop_Sub32x4:
+//      case Iop_CmpGT32Sx4:
+//      case Iop_CmpGT32Ux4:
+//      case Iop_CmpEQ32x4:
+//      case Iop_QAdd32Sx4:
+//      case Iop_QAdd32Ux4:
+//      case Iop_QSub32Sx4:
+//      case Iop_QSub32Ux4:
+//      case Iop_Avg32Ux4:
+//      case Iop_Avg32Sx4:
+//      case Iop_Add32x4:
+//      case Iop_Max32Ux4:
+//      case Iop_Max32Sx4:
+//      case Iop_Min32Ux4:
+//      case Iop_Min32Sx4:
+//         return binary32Ix4(mce, vatom1, vatom2);
+//
+//      case Iop_Sub64x2:
+//      case Iop_Add64x2:
+//         return binary64Ix2(mce, vatom1, vatom2);
+//
+//      case Iop_QNarrowBin32Sto16Sx8:
+//      case Iop_QNarrowBin32Uto16Ux8:
+//      case Iop_QNarrowBin32Sto16Ux8:
+//      case Iop_QNarrowBin16Sto8Sx16:
+//      case Iop_QNarrowBin16Uto8Ux16:
+//      case Iop_QNarrowBin16Sto8Ux16:
+//         return vectorNarrowBinV128(mce, op, vatom1, vatom2);
+//
+//      case Iop_Sub64Fx2:
+//      case Iop_Mul64Fx2:
+//      case Iop_Min64Fx2:
+//      case Iop_Max64Fx2:
+//      case Iop_Div64Fx2:
+//      case Iop_CmpLT64Fx2:
+//      case Iop_CmpLE64Fx2:
+//      case Iop_CmpEQ64Fx2:
+//      case Iop_CmpUN64Fx2:
+//      case Iop_Add64Fx2:
+//         return binary64Fx2(mce, vatom1, vatom2);
+//
+//      case Iop_Sub64F0x2:
+//      case Iop_Mul64F0x2:
+//      case Iop_Min64F0x2:
+//      case Iop_Max64F0x2:
+//      case Iop_Div64F0x2:
+//      case Iop_CmpLT64F0x2:
+//      case Iop_CmpLE64F0x2:
+//      case Iop_CmpEQ64F0x2:
+//      case Iop_CmpUN64F0x2:
+//      case Iop_Add64F0x2:
+//         return binary64F0x2(mce, vatom1, vatom2);
+//
+//      case Iop_Sub32Fx4:
+//      case Iop_Mul32Fx4:
+//      case Iop_Min32Fx4:
+//      case Iop_Max32Fx4:
+//      case Iop_Div32Fx4:
+//      case Iop_CmpLT32Fx4:
+//      case Iop_CmpLE32Fx4:
+//      case Iop_CmpEQ32Fx4:
+//      case Iop_CmpUN32Fx4:
+//      case Iop_CmpGT32Fx4:
+//      case Iop_CmpGE32Fx4:
+//      case Iop_Add32Fx4:
+//         return binary32Fx4(mce, vatom1, vatom2);
+//
+//      case Iop_Sub32F0x4:
+//      case Iop_Mul32F0x4:
+//      case Iop_Min32F0x4:
+//      case Iop_Max32F0x4:
+//      case Iop_Div32F0x4:
+//      case Iop_CmpLT32F0x4:
+//      case Iop_CmpLE32F0x4:
+//      case Iop_CmpEQ32F0x4:
+//      case Iop_CmpUN32F0x4:
+//      case Iop_Add32F0x4:
+//         return binary32F0x4(mce, vatom1, vatom2);
+//
+//      /* V128-bit data-steering */
+//      case Iop_SetV128lo32:
+//      case Iop_SetV128lo64:
+//      case Iop_64HLtoV128:
+//      case Iop_InterleaveLO64x2:
+//      case Iop_InterleaveLO32x4:
+//      case Iop_InterleaveLO16x8:
+//      case Iop_InterleaveLO8x16:
+//      case Iop_InterleaveHI64x2:
+//      case Iop_InterleaveHI32x4:
+//      case Iop_InterleaveHI16x8:
+//      case Iop_InterleaveHI8x16:
+//         return assignNew('V', mce, Ity_V128, binop(op, vatom1, vatom2));
+//
+//     /* Perm8x16: rearrange values in left arg using steering values
+//        from right arg.  So rearrange the vbits in the same way but
+//        pessimise wrt steering values. */
+//      case Iop_Perm8x16:
+//         return mkUifUV128(
+//                   mce,
+//                   assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2)),
+//                   mkPCast8x16(mce, vatom2)
+//                );
+//
+//     /* These two take the lower half of each 16-bit lane, sign/zero
+//        extend it to 32, and multiply together, producing a 32x4
+//        result (and implicitly ignoring half the operand bits).  So
+//        treat it as a bunch of independent 16x8 operations, but then
+//        do 32-bit shifts left-right to copy the lower half results
+//        (which are all 0s or all 1s due to PCasting in binary16Ix8)
+//        into the upper half of each result lane. */
+//      case Iop_MullEven16Ux8:
+//      case Iop_MullEven16Sx8: {
+//         IRAtom* at;
+//         at = binary16Ix8(mce,vatom1,vatom2);
+//         at = assignNew('V', mce, Ity_V128, binop(Iop_ShlN32x4, at, mkU8(16)));
+//         at = assignNew('V', mce, Ity_V128, binop(Iop_SarN32x4, at, mkU8(16)));
+//         return at;
+//      }
+//
+//      /* Same deal as Iop_MullEven16{S,U}x8 */
+//      case Iop_MullEven8Ux16:
+//      case Iop_MullEven8Sx16: {
+//         IRAtom* at;
+//         at = binary8Ix16(mce,vatom1,vatom2);
+//         at = assignNew('V', mce, Ity_V128, binop(Iop_ShlN16x8, at, mkU8(8)));
+//         at = assignNew('V', mce, Ity_V128, binop(Iop_SarN16x8, at, mkU8(8)));
+//         return at;
+//      }
+//
+//      /* narrow 2xV128 into 1xV128, hi half from left arg, in a 2 x
+//         32x4 -> 16x8 laneage, discarding the upper half of each lane.
+//         Simply apply same op to the V bits, since this really no more
+//         than a data steering operation. */
+//      case Iop_NarrowBin32to16x8:
+//      case Iop_NarrowBin16to8x16:
+//         return assignNew('V', mce, Ity_V128,
+//                                    binop(op, vatom1, vatom2));
+//
+//      case Iop_ShrV128:
+//      case Iop_ShlV128:
+//         /* Same scheme as with all other shifts.  Note: 10 Nov 05:
+//            this is wrong now, scalar shifts are done properly lazily.
+//            Vector shifts should be fixed too. */
+//         // Taintgrind: Checked in do_shadow_WRTMP
+////         complainIfTainted(mce, atom2);
+//         return assignNew('V', mce, Ity_V128, binop(op, vatom1, atom2));
+//
+//      /* I128-bit data-steering */
+//      case Iop_64HLto128:
+//         return assignNew('V', mce, Ity_I128, binop(op, vatom1, vatom2));
+//
+//      /* Scalar floating point */
+//
+//      case Iop_RoundF64toInt:
+//      case Iop_RoundF64toF32:
+//      case Iop_F64toI64S:
+//      case Iop_I64StoF64:
+//      case Iop_SinF64:
+//      case Iop_CosF64:
+//      case Iop_TanF64:
+//      case Iop_2xm1F64:
+//      case Iop_SqrtF64:
+//         /* I32(rm) x I64/F64 -> I64/F64 */
+//         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+//
+//      case Iop_F64toI32S:
+//      case Iop_F64toI32U:
+//      case Iop_F64toF32:
+//         /* First arg is I32 (rounding mode), second is F64 (data). */
+//         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+//
+//      case Iop_F64toI16S:
+//         /* First arg is I32 (rounding mode), second is F64 (data). */
+//         return mkLazy2(mce, Ity_I16, vatom1, vatom2);
+//
+//      case Iop_CmpF64:
+//         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+//
+//      /* non-FP after here */
+//
+//      case Iop_DivModU64to32:
+//      case Iop_DivModS64to32:
+//         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+//
+//      case Iop_DivModU128to64:
+//      case Iop_DivModS128to64:
+//         return mkLazy2(mce, Ity_I128, vatom1, vatom2);
+//
+//      case Iop_8HLto16:
+//         return assignNew('V', mce, Ity_I16, binop(op, vatom1, vatom2));
+//      case Iop_16HLto32:
+//         return assignNew('V', mce, Ity_I32, binop(op, vatom1, vatom2));
+//      case Iop_32HLto64:
+//         return assignNew('V', mce, Ity_I64, binop(op, vatom1, vatom2));
+//
+//      case Iop_DivModS64to64:
+//      case Iop_MullS64:
+//      case Iop_MullU64: {
+//         IRAtom* vLo64 = mkLeft64(mce, mkUifU64(mce, vatom1,vatom2));
+//         IRAtom* vHi64 = mkPCastTo(mce, Ity_I64, vLo64);
+//         return assignNew('V', mce, Ity_I128, binop(Iop_64HLto128, vHi64, vLo64));
+//      }
+//
+//      case Iop_MullS32:
+//      case Iop_MullU32: {
+//         IRAtom* vLo32 = mkLeft32(mce, mkUifU32(mce, vatom1,vatom2));
+//         IRAtom* vHi32 = mkPCastTo(mce, Ity_I32, vLo32);
+//         return assignNew('V', mce, Ity_I64, binop(Iop_32HLto64, vHi32, vLo32));
+//      }
+//
+//      case Iop_MullS16:
+//      case Iop_MullU16: {
+//         IRAtom* vLo16 = mkLeft16(mce, mkUifU16(mce, vatom1,vatom2));
+//         IRAtom* vHi16 = mkPCastTo(mce, Ity_I16, vLo16);
+//         return assignNew('V', mce, Ity_I32, binop(Iop_16HLto32, vHi16, vLo16));
+//      }
+//
+//      case Iop_MullS8:
+//      case Iop_MullU8: {
+//         IRAtom* vLo8 = mkLeft8(mce, mkUifU8(mce, vatom1,vatom2));
+//         IRAtom* vHi8 = mkPCastTo(mce, Ity_I8, vLo8);
+//         return assignNew('V', mce, Ity_I16, binop(Iop_8HLto16, vHi8, vLo8));
+//      }
+//
+//      case Iop_DivS32:
+//      case Iop_DivU32:
+//         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+//
+//      case Iop_DivS64:
+//      case Iop_DivU64:
+//         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+//
+//      case Iop_Add32:
+//         // Taintgrind
+////         complainIfUndefined(mce, atom2);
+//         if (mce->bogusLiterals)
+//            return expensiveAddSub(mce,True,Ity_I32,
+//                                   vatom1,vatom2, atom1,atom2);
+//         else
+//            goto cheap_AddSub32;
+//      case Iop_Sub32:
+//         if (mce->bogusLiterals)
+//            return expensiveAddSub(mce,False,Ity_I32,
+//                                   vatom1,vatom2, atom1,atom2);
+//         else
+//            goto cheap_AddSub32;
+//
+//      cheap_AddSub32:
+//      case Iop_Mul32:
+//         return mkLeft32(mce, mkUifU32(mce, vatom1,vatom2));
+//
+//      case Iop_CmpORD32S:
+//      case Iop_CmpORD32U:
+//      case Iop_CmpORD64S:
+//      case Iop_CmpORD64U:
+//         return doCmpORD(mce, op, vatom1,vatom2, atom1,atom2);
+//
+//      case Iop_Add64:
+//         if (mce->bogusLiterals)
+//            return expensiveAddSub(mce,True,Ity_I64,
+//                                   vatom1,vatom2, atom1,atom2);
+//         else
+//            goto cheap_AddSub64;
+//      case Iop_Sub64:
+//         if (mce->bogusLiterals)
+//            return expensiveAddSub(mce,False,Ity_I64,
+//                                   vatom1,vatom2, atom1,atom2);
+//         else
+//            goto cheap_AddSub64;
+//
+//      cheap_AddSub64:
+//      case Iop_Mul64:
+//         return mkLeft64(mce, mkUifU64(mce, vatom1,vatom2));
+//
+//      case Iop_Mul16:
+//      case Iop_Add16:
+//      case Iop_Sub16:
+//         // Taintgrind
+////         complainIfUndefined(mce, atom2);
+//         return mkLeft16(mce, mkUifU16(mce, vatom1,vatom2));
+//
+//      case Iop_Sub8:
+//      case Iop_Add8:
+//         // Taintgrind
+////         complainIfUndefined(mce, atom2);
+//         return mkLeft8(mce, mkUifU8(mce, vatom1,vatom2));
+//
+//      case Iop_CmpEQ64:
+//      case Iop_CmpNE64:
+//         if (mce->bogusLiterals)
+//            return expensiveCmpEQorNE(mce,Ity_I64, vatom1,vatom2, atom1,atom2 );
+//         else
+//            goto cheap_cmp64;
+//      cheap_cmp64:
+//      case Iop_CmpLE64S: case Iop_CmpLE64U:
+//      case Iop_CmpLT64U: case Iop_CmpLT64S:
+//         return mkPCastTo(mce, Ity_I1, mkUifU64(mce, vatom1,vatom2));
+//
+//      case Iop_CmpEQ32:
+//      case Iop_CmpNE32:
+//         if (mce->bogusLiterals)
+//            goto expensive_cmp32;
+//         else
+//            goto cheap_cmp32;
+//
+//      expensive_cmp32:
+//      case Iop_ExpCmpNE32:
+//            return expensiveCmpEQorNE(mce,Ity_I32, vatom1,vatom2, atom1,atom2 );
+//
+//      cheap_cmp32:
+//      case Iop_CmpLE32S: case Iop_CmpLE32U:
+//      case Iop_CmpLT32U: case Iop_CmpLT32S:
+//         return mkPCastTo(mce, Ity_I1, mkUifU32(mce, vatom1,vatom2));
+//
+//      case Iop_CmpEQ16: case Iop_CmpNE16:
+//         return mkPCastTo(mce, Ity_I1, mkUifU16(mce, vatom1,vatom2));
+//
+//      case Iop_CmpEQ8: case Iop_CmpNE8:
+//         return mkPCastTo(mce, Ity_I1, mkUifU8(mce, vatom1,vatom2));
+//
+//      case Iop_CasCmpEQ8:  case Iop_CasCmpNE8:
+//      case Iop_CasCmpEQ16: case Iop_CasCmpNE16:
+//      case Iop_CasCmpEQ32: case Iop_CasCmpNE32:
+//      case Iop_CasCmpEQ64: case Iop_CasCmpNE64:
+//         /* Just say these all produce a defined result, regardless
+//            of their arguments.  See COMMENT_ON_CasCmpEQ in this file. */
+//         return assignNew('V', mce, Ity_I1, definedOfType(Ity_I1));
+//
+//      case Iop_Shl64: case Iop_Shr64: case Iop_Sar64:
+//         return scalarShift( mce, Ity_I64, op, vatom1,vatom2, atom1,atom2 );
+//
+//      case Iop_Shl32: case Iop_Shr32: case Iop_Sar32:
+//         return scalarShift( mce, Ity_I32, op, vatom1,vatom2, atom1,atom2 );
+//
+//      case Iop_Shl16: case Iop_Shr16: case Iop_Sar16:
+//         return scalarShift( mce, Ity_I16, op, vatom1,vatom2, atom1,atom2 );
+//
+//      case Iop_Shl8: case Iop_Shr8:
+//         return scalarShift( mce, Ity_I8, op, vatom1,vatom2, atom1,atom2 );
+//
+//      case Iop_AndV128:
+//         uifu = mkUifUV128; difd = mkDifDV128;
+//         and_or_ty = Ity_V128; improve = mkImproveANDV128; goto do_And_Or;
+//      case Iop_And64:
+//         uifu = mkUifU64; difd = mkDifD64;
+//         and_or_ty = Ity_I64; improve = mkImproveAND64; goto do_And_Or;
+//      case Iop_And32:
+//         uifu = mkUifU32; difd = mkDifD32;
+//         and_or_ty = Ity_I32; improve = mkImproveAND32; goto do_And_Or;
+//      case Iop_And16:
+//         uifu = mkUifU16; difd = mkDifD16;
+//         and_or_ty = Ity_I16; improve = mkImproveAND16; goto do_And_Or;
+//      case Iop_And8:
+//         uifu = mkUifU8; difd = mkDifD8;
+//         and_or_ty = Ity_I8; improve = mkImproveAND8; goto do_And_Or;
+//
+//      case Iop_OrV128:
+//         uifu = mkUifUV128; difd = mkDifDV128;
+//         and_or_ty = Ity_V128; improve = mkImproveORV128; goto do_And_Or;
+//      case Iop_Or64:
+//         uifu = mkUifU64; difd = mkDifD64;
+//         and_or_ty = Ity_I64; improve = mkImproveOR64; goto do_And_Or;
+//      case Iop_Or32:
+//         uifu = mkUifU32; difd = mkDifD32;
+//         and_or_ty = Ity_I32; improve = mkImproveOR32; goto do_And_Or;
+//      case Iop_Or16:
+//         uifu = mkUifU16; difd = mkDifD16;
+//         and_or_ty = Ity_I16; improve = mkImproveOR16; goto do_And_Or;
+//      case Iop_Or8:
+//         uifu = mkUifU8; difd = mkDifD8;
+//         and_or_ty = Ity_I8; improve = mkImproveOR8; goto do_And_Or;
+//
+//      do_And_Or:
+//         return
+//         assignNew(
+//            'V', mce,
+//            and_or_ty,
+//            difd(mce, uifu(mce, vatom1, vatom2),
+//                      difd(mce, improve(mce, atom1, vatom1),
+//                                improve(mce, atom2, vatom2) ) ) );
+//
+//      case Iop_Xor8:
+//         return mkUifU8(mce, vatom1, vatom2);
+//      case Iop_Xor16:
+//         return mkUifU16(mce, vatom1, vatom2);
+//      case Iop_Xor32:
+//         return mkUifU32(mce, vatom1, vatom2);
+//      case Iop_Xor64:
+//         return mkUifU64(mce, vatom1, vatom2);
+//      case Iop_XorV128:
+//         return mkUifUV128(mce, vatom1, vatom2);
+//
+//      default:
+//         ppIROp(op);
+//         VG_(tool_panic)("tnt_translate.c: expr2vbits_Binop");
+//   }
+//}
+
+
+static 
 IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
 {
-   IRAtom* vatom = atom2vbits( mce, atom );
+   /* For the widening operations {8,16,32}{U,S}to{16,32,64}, the
+      selection of shadow operation implicitly duplicates the logic in
+      do_shadow_LoadG and should be kept in sync (in the very unlikely
+      event that the interpretation of such widening ops changes in
+      future).  See comment in do_shadow_LoadG. */
+   IRAtom* vatom = expr2vbits( mce, atom );
    tl_assert(isOriginalAtom(mce,atom));
    switch (op) {
 
@@ -2513,6 +3955,14 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
 
       case Iop_Sqrt64F0x2:
          return unary64F0x2(mce, vatom);
+
+      case Iop_Sqrt32Fx8:
+      case Iop_RSqrt32Fx8:
+      case Iop_Recip32Fx8:
+         return unary32Fx8(mce, vatom);
+
+      case Iop_Sqrt64Fx4:
+         return unary64Fx4(mce, vatom);
 
       case Iop_Sqrt32Fx4:
       case Iop_RSqrt32Fx4:
@@ -2525,7 +3975,20 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_RoundF32x4_RP:
       case Iop_RoundF32x4_RN:
       case Iop_RoundF32x4_RZ:
+      case Iop_Recip32x4:
+      case Iop_Abs32Fx4:
+      case Iop_Neg32Fx4:
+      case Iop_Rsqrte32Fx4:
          return unary32Fx4(mce, vatom);
+
+      case Iop_I32UtoFx2:
+      case Iop_I32StoFx2:
+      case Iop_Recip32Fx2:
+      case Iop_Recip32x2:
+      case Iop_Abs32Fx2:
+      case Iop_Neg32Fx2:
+      case Iop_Rsqrte32Fx2:
+         return unary32Fx2(mce, vatom);
 
       case Iop_Sqrt32F0x4:
       case Iop_RSqrt32F0x4:
@@ -2537,9 +4000,39 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_Dup8x16:
       case Iop_Dup16x8:
       case Iop_Dup32x4:
+      case Iop_Reverse16_8x16:
+      case Iop_Reverse32_8x16:
+      case Iop_Reverse32_16x8:
+      case Iop_Reverse64_8x16:
+      case Iop_Reverse64_16x8:
+      case Iop_Reverse64_32x4:
+      case Iop_V256toV128_1: case Iop_V256toV128_0:
          return assignNew('V', mce, Ity_V128, unop(op, vatom));
 
-      case Iop_F32toF64:
+      case Iop_F128HItoF64:  /* F128 -> high half of F128 */
+      case Iop_D128HItoD64:  /* D128 -> high half of D128 */
+         return assignNew('V', mce, Ity_I64, unop(Iop_128HIto64, vatom));
+      case Iop_F128LOtoF64:  /* F128 -> low  half of F128 */
+      case Iop_D128LOtoD64:  /* D128 -> low  half of D128 */
+         return assignNew('V', mce, Ity_I64, unop(Iop_128to64, vatom));
+
+      case Iop_NegF128:
+      case Iop_AbsF128:
+         return mkPCastTo(mce, Ity_I128, vatom);
+
+      case Iop_I32StoF128: /* signed I32 -> F128 */
+      case Iop_I64StoF128: /* signed I64 -> F128 */
+      case Iop_I32UtoF128: /* unsigned I32 -> F128 */
+      case Iop_I64UtoF128: /* unsigned I64 -> F128 */
+      case Iop_F32toF128:  /* F32 -> F128 */
+      case Iop_F64toF128:  /* F64 -> F128 */
+      case Iop_I32StoD128: /* signed I64 -> D128 */
+      case Iop_I64StoD128: /* signed I64 -> D128 */
+      case Iop_I32UtoD128: /* unsigned I32 -> D128 */
+      case Iop_I64UtoD128: /* unsigned I64 -> D128 */
+         return mkPCastTo(mce, Ity_I128, vatom);
+
+      case Iop_F32toF64: 
       case Iop_I32StoF64:
       case Iop_I32UtoF64:
       case Iop_NegF64:
@@ -2550,15 +4043,32 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_RoundF64toF64_PosINF:
       case Iop_RoundF64toF64_ZERO:
       case Iop_Clz64:
-      case Iop_Ctz64:
+      case Iop_D32toD64:
+      case Iop_I32StoD64:
+      case Iop_I32UtoD64:
+      case Iop_ExtractExpD64:    /* D64  -> I64 */
+      case Iop_ExtractExpD128:   /* D128 -> I64 */
+      case Iop_ExtractSigD64:    /* D64  -> I64 */
+      case Iop_ExtractSigD128:   /* D128 -> I64 */
+      case Iop_DPBtoBCD:
+      case Iop_BCDtoDPB:
          return mkPCastTo(mce, Ity_I64, vatom);
 
+      case Iop_D64toD128:
+         return mkPCastTo(mce, Ity_I128, vatom);
+
       case Iop_Clz32:
-      case Iop_Ctz32:
       case Iop_TruncF64asF32:
+      case Iop_NegF32:
+      case Iop_AbsF32:
          return mkPCastTo(mce, Ity_I32, vatom);
 
+      case Iop_Ctz32:
+      case Iop_Ctz64:
+         return expensiveCountTrailingZeroes(mce, op, atom, vatom);
+
       case Iop_1Uto64:
+      case Iop_1Sto64:
       case Iop_8Uto64:
       case Iop_8Sto64:
       case Iop_16Uto64:
@@ -2569,6 +4079,17 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_V128HIto64:
       case Iop_128HIto64:
       case Iop_128to64:
+      case Iop_Dup8x8:
+      case Iop_Dup16x4:
+      case Iop_Dup32x2:
+      case Iop_Reverse16_8x8:
+      case Iop_Reverse32_8x8:
+      case Iop_Reverse32_16x4:
+      case Iop_Reverse64_8x8:
+      case Iop_Reverse64_16x4:
+      case Iop_Reverse64_32x2:
+      case Iop_V256to64_0: case Iop_V256to64_1:
+      case Iop_V256to64_2: case Iop_V256to64_3:
          return assignNew('V', mce, Ity_I64, unop(op, vatom));
 
       case Iop_64to32:
@@ -2587,13 +4108,16 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_32to16:
       case Iop_32HIto16:
       case Iop_64to16:
+      case Iop_GetMSBs8x16:
          return assignNew('V', mce, Ity_I16, unop(op, vatom));
 
       case Iop_1Uto8:
+      case Iop_1Sto8:
       case Iop_16to8:
       case Iop_16HIto8:
       case Iop_32to8:
       case Iop_64to8:
+      case Iop_GetMSBs8x8:
          return assignNew('V', mce, Ity_I8, unop(op, vatom));
 
       case Iop_32to1:
@@ -2605,6 +4129,10 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_ReinterpF64asI64:
       case Iop_ReinterpI64asF64:
       case Iop_ReinterpI32asF32:
+      case Iop_ReinterpF32asI32:
+      case Iop_ReinterpI64asD64:
+      case Iop_ReinterpD64asI64:
+      case Iop_NotV256:
       case Iop_NotV128:
       case Iop_Not64:
       case Iop_Not32:
@@ -2612,6 +4140,62 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_Not8:
       case Iop_Not1:
          return vatom;
+
+      case Iop_CmpNEZ8x8:
+      case Iop_Cnt8x8:
+      case Iop_Clz8Sx8:
+      case Iop_Cls8Sx8:
+      case Iop_Abs8x8:
+         return mkPCast8x8(mce, vatom);
+
+      case Iop_CmpNEZ8x16:
+      case Iop_Cnt8x16:
+      case Iop_Clz8Sx16:
+      case Iop_Cls8Sx16:
+      case Iop_Abs8x16:
+         return mkPCast8x16(mce, vatom);
+
+      case Iop_CmpNEZ16x4:
+      case Iop_Clz16Sx4:
+      case Iop_Cls16Sx4:
+      case Iop_Abs16x4:
+         return mkPCast16x4(mce, vatom);
+
+      case Iop_CmpNEZ16x8:
+      case Iop_Clz16Sx8:
+      case Iop_Cls16Sx8:
+      case Iop_Abs16x8:
+         return mkPCast16x8(mce, vatom);
+
+      case Iop_CmpNEZ32x2:
+      case Iop_Clz32Sx2:
+      case Iop_Cls32Sx2:
+      case Iop_FtoI32Ux2_RZ:
+      case Iop_FtoI32Sx2_RZ:
+      case Iop_Abs32x2:
+         return mkPCast32x2(mce, vatom);
+
+      case Iop_CmpNEZ32x4:
+      case Iop_Clz32Sx4:
+      case Iop_Cls32Sx4:
+      case Iop_FtoI32Ux4_RZ:
+      case Iop_FtoI32Sx4_RZ:
+      case Iop_Abs32x4:
+         return mkPCast32x4(mce, vatom);
+
+      case Iop_CmpwNEZ32:
+         return mkPCastTo(mce, Ity_I32, vatom);
+
+      case Iop_CmpwNEZ64:
+         return mkPCastTo(mce, Ity_I64, vatom);
+
+      case Iop_CmpNEZ64x2:
+      case Iop_CipherSV128:
+      case Iop_Clz64x2:
+         return mkPCast64x2(mce, vatom);
+
+      case Iop_PwBitMtxXpose64x2:
+         return assignNew('V', mce, Ity_V128, unop(op, vatom));
 
       case Iop_NarrowUn16to8x8:
       case Iop_NarrowUn32to16x4:
@@ -2635,11 +4219,244 @@ IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
       case Iop_Widen32Uto64x2:
          return vectorWidenI64(mce, op, vatom);
 
+      case Iop_PwAddL32Ux2:
+      case Iop_PwAddL32Sx2:
+         return mkPCastTo(mce, Ity_I64,
+               assignNew('V', mce, Ity_I64, unop(op, mkPCast32x2(mce, vatom))));
+
+      case Iop_PwAddL16Ux4:
+      case Iop_PwAddL16Sx4:
+         return mkPCast32x2(mce,
+               assignNew('V', mce, Ity_I64, unop(op, mkPCast16x4(mce, vatom))));
+
+      case Iop_PwAddL8Ux8:
+      case Iop_PwAddL8Sx8:
+         return mkPCast16x4(mce,
+               assignNew('V', mce, Ity_I64, unop(op, mkPCast8x8(mce, vatom))));
+
+      case Iop_PwAddL32Ux4:
+      case Iop_PwAddL32Sx4:
+         return mkPCast64x2(mce,
+               assignNew('V', mce, Ity_V128, unop(op, mkPCast32x4(mce, vatom))));
+
+      case Iop_PwAddL16Ux8:
+      case Iop_PwAddL16Sx8:
+         return mkPCast32x4(mce,
+               assignNew('V', mce, Ity_V128, unop(op, mkPCast16x8(mce, vatom))));
+
+      case Iop_PwAddL8Ux16:
+      case Iop_PwAddL8Sx16:
+         return mkPCast16x8(mce,
+               assignNew('V', mce, Ity_V128, unop(op, mkPCast8x16(mce, vatom))));
+
+      case Iop_I64UtoF32:
       default:
          ppIROp(op);
-         VG_(tool_panic)("tnt_translate.c: expr2vbits_Unop");
+         VG_(tool_panic)("memcheck:expr2vbits_Unop");
    }
 }
+
+//static
+//IRExpr* expr2vbits_Unop ( MCEnv* mce, IROp op, IRAtom* atom )
+//{
+//   IRAtom* vatom = atom2vbits( mce, atom );
+//   tl_assert(isOriginalAtom(mce,atom));
+//   switch (op) {
+//
+//      case Iop_Sqrt64Fx2:
+//         return unary64Fx2(mce, vatom);
+//
+//      case Iop_Sqrt64F0x2:
+//         return unary64F0x2(mce, vatom);
+//
+//      case Iop_Sqrt32Fx4:
+//      case Iop_RSqrt32Fx4:
+//      case Iop_Recip32Fx4:
+//      case Iop_I32UtoFx4:
+//      case Iop_I32StoFx4:
+//      case Iop_QFtoI32Ux4_RZ:
+//      case Iop_QFtoI32Sx4_RZ:
+//      case Iop_RoundF32x4_RM:
+//      case Iop_RoundF32x4_RP:
+//      case Iop_RoundF32x4_RN:
+//      case Iop_RoundF32x4_RZ:
+//         return unary32Fx4(mce, vatom);
+//
+//      case Iop_Sqrt32F0x4:
+//      case Iop_RSqrt32F0x4:
+//      case Iop_Recip32F0x4:
+//         return unary32F0x4(mce, vatom);
+//
+//      case Iop_32UtoV128:
+//      case Iop_64UtoV128:
+//      case Iop_Dup8x16:
+//      case Iop_Dup16x8:
+//      case Iop_Dup32x4:
+//         return assignNew('V', mce, Ity_V128, unop(op, vatom));
+//
+//      case Iop_F32toF64:
+//      case Iop_I32StoF64:
+//      case Iop_I32UtoF64:
+//      case Iop_NegF64:
+//      case Iop_AbsF64:
+//      case Iop_Est5FRSqrt:
+//      case Iop_RoundF64toF64_NEAREST:
+//      case Iop_RoundF64toF64_NegINF:
+//      case Iop_RoundF64toF64_PosINF:
+//      case Iop_RoundF64toF64_ZERO:
+//      case Iop_Clz64:
+//      case Iop_Ctz64:
+//         return mkPCastTo(mce, Ity_I64, vatom);
+//
+//      case Iop_Clz32:
+//      case Iop_Ctz32:
+//      case Iop_TruncF64asF32:
+//         return mkPCastTo(mce, Ity_I32, vatom);
+//
+//      case Iop_1Uto64:
+//      case Iop_8Uto64:
+//      case Iop_8Sto64:
+//      case Iop_16Uto64:
+//      case Iop_16Sto64:
+//      case Iop_32Sto64:
+//      case Iop_32Uto64:
+//      case Iop_V128to64:
+//      case Iop_V128HIto64:
+//      case Iop_128HIto64:
+//      case Iop_128to64:
+//         return assignNew('V', mce, Ity_I64, unop(op, vatom));
+//
+//      case Iop_64to32:
+//      case Iop_64HIto32:
+//      case Iop_1Uto32:
+//      case Iop_1Sto32:
+//      case Iop_8Uto32:
+//      case Iop_16Uto32:
+//      case Iop_16Sto32:
+//      case Iop_8Sto32:
+//      case Iop_V128to32:
+//         return assignNew('V', mce, Ity_I32, unop(op, vatom));
+//
+//      case Iop_8Sto16:
+//      case Iop_8Uto16:
+//      case Iop_32to16:
+//      case Iop_32HIto16:
+//      case Iop_64to16:
+//      case Iop_GetMSBs8x16:
+//         return assignNew('V', mce, Ity_I16, unop(op, vatom));
+//
+//      case Iop_1Uto8:
+//      case Iop_16to8:
+//      case Iop_16HIto8:
+//      case Iop_32to8:
+//      case Iop_64to8:
+//      case Iop_GetMSBs8x8:
+//         return assignNew('V', mce, Ity_I8, unop(op, vatom));
+//
+//      case Iop_32to1:
+//         return assignNew('V', mce, Ity_I1, unop(Iop_32to1, vatom));
+//
+//      case Iop_64to1:
+//         return assignNew('V', mce, Ity_I1, unop(Iop_64to1, vatom));
+//
+//      case Iop_ReinterpF64asI64:
+//      case Iop_ReinterpI64asF64:
+//      case Iop_ReinterpI32asF32:
+//      case Iop_ReinterpF32asI32:
+//      case Iop_ReinterpI64asD64:
+//      case Iop_ReinterpD64asI64:
+//      case Iop_NotV256:
+//      case Iop_NotV128:
+//      case Iop_Not64:
+//      case Iop_Not32:
+//      case Iop_Not16:
+//      case Iop_Not8:
+//      case Iop_Not1:
+//         return vatom;
+//
+//      case Iop_CmpNEZ8x8:
+//      case Iop_Cnt8x8:
+//      case Iop_Clz8Sx8:
+//      case Iop_Cls8Sx8:
+//      case Iop_Abs8x8:
+//         return mkPCast8x8(mce, vatom);
+//
+//      case Iop_CmpNEZ8x16:
+//      case Iop_Cnt8x16:
+//      case Iop_Clz8Sx16:
+//      case Iop_Cls8Sx16:
+//      case Iop_Abs8x16:
+//         return mkPCast8x16(mce, vatom);
+//
+//      case Iop_CmpNEZ16x4:
+//      case Iop_Clz16Sx4:
+//      case Iop_Cls16Sx4:
+//      case Iop_Abs16x4:
+//         return mkPCast16x4(mce, vatom);
+//
+//      case Iop_CmpNEZ16x8:
+//      case Iop_Clz16Sx8:
+//      case Iop_Cls16Sx8:
+//      case Iop_Abs16x8:
+//         return mkPCast16x8(mce, vatom);
+//
+//      case Iop_CmpNEZ32x2:
+//      case Iop_Clz32Sx2:
+//      case Iop_Cls32Sx2:
+//      case Iop_FtoI32Ux2_RZ:
+//      case Iop_FtoI32Sx2_RZ:
+//      case Iop_Abs32x2:
+//         return mkPCast32x2(mce, vatom);
+//
+//      case Iop_CmpNEZ32x4:
+//      case Iop_Clz32Sx4:
+//      case Iop_Cls32Sx4:
+//      case Iop_FtoI32Ux4_RZ:
+//      case Iop_FtoI32Sx4_RZ:
+//      case Iop_Abs32x4:
+//         return mkPCast32x4(mce, vatom);
+//
+//      case Iop_CmpwNEZ32:
+//         return mkPCastTo(mce, Ity_I32, vatom);
+//
+//      case Iop_CmpwNEZ64:
+//         return mkPCastTo(mce, Ity_I64, vatom);
+//
+//      case Iop_CmpNEZ64x2:
+//      case Iop_CipherSV128:
+//      case Iop_Clz64x2:
+//         return mkPCast64x2(mce, vatom);
+//
+//      case Iop_PwBitMtxXpose64x2:
+//         return assignNew('V', mce, Ity_V128, unop(op, vatom));
+//
+//      case Iop_NarrowUn16to8x8:
+//      case Iop_NarrowUn32to16x4:
+//      case Iop_NarrowUn64to32x2:
+//      case Iop_QNarrowUn16Sto8Sx8:
+//      case Iop_QNarrowUn16Sto8Ux8:
+//      case Iop_QNarrowUn16Uto8Ux8:
+//      case Iop_QNarrowUn32Sto16Sx4:
+//      case Iop_QNarrowUn32Sto16Ux4:
+//      case Iop_QNarrowUn32Uto16Ux4:
+//      case Iop_QNarrowUn64Sto32Sx2:
+//      case Iop_QNarrowUn64Sto32Ux2:
+//      case Iop_QNarrowUn64Uto32Ux2:
+//         return vectorNarrowUnV128(mce, op, vatom);
+//
+//      case Iop_Widen8Sto16x8:
+//      case Iop_Widen8Uto16x8:
+//      case Iop_Widen16Sto32x4:
+//      case Iop_Widen16Uto32x4:
+//      case Iop_Widen32Sto64x2:
+//      case Iop_Widen32Uto64x2:
+//         return vectorWidenI64(mce, op, vatom);
+//
+//      default:
+//         ppIROp(op);
+//         VG_(tool_panic)("tnt_translate.c: expr2vbits_Unop");
+//   }
+//}
 
 
 /* Worker function; do not call directly. */
@@ -2649,7 +4466,7 @@ IRAtom* expr2vbits_Load_WRK ( MCEnv* mce,  //2766
                               IRAtom* addr, UInt bias )
 {
    void*    helper;
-   Char*    hname;
+   HChar*    hname;
    IRDirty* di;
    IRTemp   datavbits;
    IRAtom*  addrAct;
@@ -2758,28 +4575,28 @@ IRAtom* expr2vbits_Load ( MCEnv* mce,  //2851
 }
 
 static
-IRAtom* expr2vbits_Mux0X ( MCEnv* mce, //2881
-                           IRAtom* cond, IRAtom* expr0, IRAtom* exprX )
+IRAtom* expr2vbits_ITE ( MCEnv* mce, //2881
+                         IRAtom* cond, IRAtom* iftrue, IRAtom* iffalse )
 {
-   IRAtom *vbitsC, *vbits0, *vbitsX;
+   IRAtom *vbitsC, *vbitsT, *vbitsF;
    IRType ty;
-   /* Given Mux0X(cond,expr0,exprX), generate
-         Mux0X(cond,expr0#,exprX#) `UifU` PCast(cond#)
+   /* Given ITE(cond,iftrue,iffalse), generate
+         ITE(cond,iftrue#,iffalse#) `UifU` PCast(cond#)
       That is, steer the V bits like the originals, but trash the
       result if the steering value is undefined.  This gives
       lazy propagation. */
    tl_assert(isOriginalAtom(mce, cond));
-   tl_assert(isOriginalAtom(mce, expr0));
-   tl_assert(isOriginalAtom(mce, exprX));
+   tl_assert(isOriginalAtom(mce, iftrue));
+   tl_assert(isOriginalAtom(mce, iffalse));
 
    vbitsC = atom2vbits(mce, cond);
-   vbits0 = atom2vbits(mce, expr0);
-   vbitsX = atom2vbits(mce, exprX);
-   ty = typeOfIRExpr(mce->sb->tyenv, vbits0);
+   vbitsT = atom2vbits(mce, iftrue);
+   vbitsF = atom2vbits(mce, iffalse);
+   ty = typeOfIRExpr(mce->sb->tyenv, vbitsT);
 
    return
       mkUifU(mce, ty, assignNew('V', mce, ty,
-                                     IRExpr_Mux0X(cond, vbits0, vbitsX)),
+                                     IRExpr_ITE(cond, vbitsT, vbitsF)),
                       mkPCastTo(mce, ty, vbitsC) );
 }
 
@@ -2840,9 +4657,9 @@ IRExpr* expr2vbits ( MCEnv* mce, IRExpr* e ) //2909
                               e->Iex.CCall.retty,
                               e->Iex.CCall.cee );
 
-      case Iex_Mux0X:
-         return expr2vbits_Mux0X( mce, e->Iex.Mux0X.cond, e->Iex.Mux0X.expr0,
-                                       e->Iex.Mux0X.exprX );
+      case Iex_ITE:
+         return expr2vbits_ITE( mce, e->Iex.ITE.cond, e->Iex.ITE.iftrue,
+                                     e->Iex.ITE.iffalse );
 
       default:
          VG_(printf)("\n");
@@ -2960,7 +4777,7 @@ void do_shadow_Store ( MCEnv* mce,   // 3032
    IROp     mkAdd;
    IRType   ty, tyAddr;
    void*    helper = NULL;
-   Char*    hname = NULL;
+   HChar*   hname = NULL;
 //   IRConst* c;
    IRDirty* di2;
 
@@ -3180,10 +4997,12 @@ void do_shadow_Dirty ( MCEnv* mce, IRDirty* d ) // 3224
 
    /* Inputs: unmasked args */
    for (i = 0; d->args[i]; i++) {
-      if (d->cee->mcx_mask & (1<<i)) {
+      IRAtom* arg = d->args[i];
+      if (d->cee->mcx_mask & (1<<i)
+           || UNLIKELY(is_IRExpr_VECRET_or_BBPTR(arg)) ) {
          /* ignore this arg */
       } else {
-         here = mkPCastTo( mce, Ity_I32, atom2vbits(mce, d->args[i]) );
+         here = mkPCastTo( mce, Ity_I32, atom2vbits(mce, arg) );
          curr = mkUifU32(mce, here, curr);
       }
    }
@@ -3222,11 +5041,11 @@ void do_shadow_Dirty ( MCEnv* mce, IRDirty* d ) // 3224
                all-bits-defined bit pattern */
             IRAtom *cond, *iffalse, *iftrue;
 
-            cond    = assignNew('V', mce, Ity_I8, unop(Iop_1Uto8, d->guard));
+            cond    = assignNew('V', mce, Ity_I1, d->guard);
             iftrue  = assignNew('V', mce, tySrc, shadow_GET(mce, gOff, tySrc));
             iffalse = assignNew('V', mce, tySrc, definedOfType(tySrc));
             src     = assignNew('V', mce, tySrc,
-                                IRExpr_Mux0X(cond, iffalse, iftrue));
+                                IRExpr_ITE(cond, iftrue, iffalse));
 
             here = mkPCastTo( mce, Ity_I32, src );
             curr = mkUifU32(mce, here, curr);
@@ -3524,7 +5343,7 @@ static void do_shadow_CAS_single ( MCEnv* mce, IRCAS* cas )
    IRAtom *voldLo  = NULL/*, *boldLo  = NULL*/;
    IRAtom *expd_eq_old = NULL;
    IROp   opCasCmpEQ;
-   Int    elemSzB;
+   //Int    elemSzB;
    IRType elemTy;
 //   Bool   otrak = TNT_(clo_tnt_level) >= 3; /* a shorthand */
 
@@ -3535,10 +5354,10 @@ static void do_shadow_CAS_single ( MCEnv* mce, IRCAS* cas )
 
    elemTy = typeOfIRExpr(mce->sb->tyenv, cas->expdLo);
    switch (elemTy) {
-      case Ity_I8:  elemSzB = 1; opCasCmpEQ = Iop_CasCmpEQ8;  break;
-      case Ity_I16: elemSzB = 2; opCasCmpEQ = Iop_CasCmpEQ16; break;
-      case Ity_I32: elemSzB = 4; opCasCmpEQ = Iop_CasCmpEQ32; break;
-      case Ity_I64: elemSzB = 8; opCasCmpEQ = Iop_CasCmpEQ64; break;
+      case Ity_I8:  /*elemSzB = 1;*/ opCasCmpEQ = Iop_CasCmpEQ8;  break;
+      case Ity_I16: /*elemSzB = 2;*/ opCasCmpEQ = Iop_CasCmpEQ16; break;
+      case Ity_I32: /*elemSzB = 4;*/ opCasCmpEQ = Iop_CasCmpEQ32; break;
+      case Ity_I64: /*elemSzB = 8;*/ opCasCmpEQ = Iop_CasCmpEQ64; break;
       default: tl_assert(0); /* IR defn disallows any other types */
    }
 
@@ -3854,10 +5673,10 @@ static Bool checkForBogusLiterals ( /*FLAT*/ IRStmt* st )
                       || isBogusAtom(e->Iex.Qop.details->arg2)
                       || isBogusAtom(e->Iex.Qop.details->arg3)
                       || isBogusAtom(e->Iex.Qop.details->arg4);
-            case Iex_Mux0X:
-               return isBogusAtom(e->Iex.Mux0X.cond)
-                      || isBogusAtom(e->Iex.Mux0X.expr0)
-                      || isBogusAtom(e->Iex.Mux0X.exprX);
+            case Iex_ITE:
+               return isBogusAtom(e->Iex.ITE.cond)
+                      || isBogusAtom(e->Iex.ITE.iftrue)
+                      || isBogusAtom(e->Iex.ITE.iffalse);
             case Iex_Load:
                return isBogusAtom(e->Iex.Load.addr);
             case Iex_CCall:
@@ -3870,9 +5689,14 @@ static Bool checkForBogusLiterals ( /*FLAT*/ IRStmt* st )
          }
       case Ist_Dirty:
          d = st->Ist.Dirty.details;
-         for (i = 0; d->args[i]; i++)
-            if (isBogusAtom(d->args[i]))
-               return True;
+         for (i = 0; d->args[i]; i++) {
+            IRAtom* atom = d->args[i];
+            if (LIKELY(!is_IRExpr_VECRET_or_BBPTR(atom))) {
+               if (isBogusAtom(atom))
+                  return True;
+            }
+
+         }
          if (d->guard && isBogusAtom(d->guard))
             return True;
          if (d->mAddr && isBogusAtom(d->mAddr))
@@ -4101,7 +5925,7 @@ Int encode_char( Char c ){
    }
 }
 
-void encode_string( Char *aStr, UInt *enc, UInt enc_size ){
+void encode_string( HChar *aStr, UInt *enc, UInt enc_size ){
    Int start = 5;
    Int next_char = 0;
    Int shift;
@@ -4152,7 +5976,7 @@ IRDirty* create_dirty_PUT( MCEnv* mce, Int offset, IRExpr* data ){
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -4202,7 +6026,7 @@ IRDirty* create_dirty_PUTI( MCEnv* mce, IRRegArray* descr, IRExpr* ix, Int bias,
    void*    fn;
    IRExpr** args;
 //   Char*    aStr;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -4271,7 +6095,7 @@ IRDirty* create_dirty_STORE( MCEnv* mce, IREndness end, IRTemp resSC,
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -4352,7 +6176,7 @@ typedef
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char*    aStr;
+   HChar*   aStr;
 /*   Char     aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };*/
@@ -4362,7 +6186,7 @@ typedef
    tl_assert( isIRAtom(details->expdLo) );
    tl_assert( isIRAtom(details->dataLo) );
 
-   aStr = (Char*)VG_(malloc)( "create_dirty_CAS", sizeof(Char)*128 );
+   aStr = (HChar*)VG_(malloc)( "create_dirty_CAS", sizeof(HChar)*128 );
 //   aStr = (Char*)VG_(cli_malloc)( VG_(clo_alignment), sizeof(Char)*128 );
 //   aStr = TNT_string[0x9700 | ( extract_IRAtom( details->addr ) & 0xff )];
 /*   aStr = TNT_string[ VG_(random)(0) & 0xffff ];
@@ -4475,14 +6299,14 @@ typedef
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Int      arg_index[4];
+   //Int      arg_index[4];
    Int      i, num_args = 0;
-   Char*    aStr;
+   HChar*   aStr;
 /*   Char     aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };*/
 
-   aStr = (Char*)VG_(malloc)( "create_dirty_DIRTY", sizeof(Char)*128 );
+   aStr = (HChar*)VG_(malloc)( "create_dirty_DIRTY", sizeof(HChar)*128 );
 //   aStr = (Char*)VG_(cli_malloc)( VG_(clo_alignment), sizeof(Char)*128 );
 /*#ifdef VGP_x86_linux
    aStr = TNT_string[0x5b00 | ( (Int)details->cee->addr/4 & 0xff )];
@@ -4513,7 +6337,7 @@ typedef
          VG_(sprintf)( aStr, "%s 0x%x", aStr, extract_IRAtom( details->args[i] ) );
       else if( details->args[i]->tag == Iex_RdTmp ){
          VG_(sprintf)( aStr, "%s t%d", aStr, extract_IRAtom( details->args[i] ) );
-         arg_index[num_args++] = i;
+         //arg_index[num_args++] = i;
       }
    }
    tl_assert( num_args <= 4 );
@@ -4586,7 +6410,7 @@ IRDirty* create_dirty_EXIT( MCEnv* mce, IRExpr* guard, IRJumpKind jk, IRConst* d
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -4637,7 +6461,7 @@ IRDirty* create_dirty_NEXT( MCEnv* mce, IRExpr* next ){
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -4769,9 +6593,9 @@ IRDirty* create_dirty_WRTMP( MCEnv* mce, IRTemp tmp, IRExpr* e ){
                                                  e->Iex.CCall.retty,
                                                  e->Iex.CCall.args );
 
-      case Iex_Mux0X:
-         return create_dirty_MUX0X( mce, tmp, e->Iex.Mux0X.cond, e->Iex.Mux0X.expr0,
-                                         e->Iex.Mux0X.exprX );
+      case Iex_ITE:
+         return create_dirty_ITE( mce, tmp, e->Iex.ITE.cond, e->Iex.ITE.iftrue,
+                                            e->Iex.ITE.iffalse );
 
       default:
          VG_(printf)("\n");
@@ -4787,11 +6611,14 @@ IRDirty* create_dirty_GET( MCEnv* mce, IRTemp tmp, Int offset, IRType ty ){
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
-   VG_(sprintf)( aTmp, "t%d=GET %d %s!", tmp, offset, IRType_string[ty & 0xfff]);
+   if ( (ty & 0xff) > 14 )
+      VG_(tool_panic)("tnt_translate.c: create_dirty_GET Unhandled type");
+
+   VG_(sprintf)( aTmp, "t%d=GET %d %s!", tmp, offset, IRType_string[ty & 0xff]);
 
    enc[0] = 0x10000000;
    encode_string( aTmp, enc, 4 );
@@ -4832,7 +6659,7 @@ IRDirty* create_dirty_GETI( MCEnv* mce, IRTemp tmp, IRRegArray* descr, IRExpr* i
    void*    fn;
    IRExpr** args;
 //   Char*    aStr;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -4860,7 +6687,9 @@ IRDirty* create_dirty_GETI( MCEnv* mce, IRTemp tmp, IRRegArray* descr, IRExpr* i
                              convert_Value( mce, IRExpr_RdTmp(tmp) ),
                              convert_Value( mce, atom2vbits( mce, IRExpr_RdTmp(tmp) ) ) );*/
 
-   VG_(sprintf)( aTmp, "t%d=GETI t%d %s!", tmp, extract_IRAtom(ix), IRType_string[descr->elemTy & 0xfff]);
+   if ( (descr->elemTy & 0xff) > 14 )
+      VG_(tool_panic)("tnt_translate.c: create_dirty_GETI Unhandled type");
+   VG_(sprintf)( aTmp, "t%d=GETI t%d %s!", tmp, extract_IRAtom(ix), IRType_string[descr->elemTy & 0xff]);
 
    enc[0] = 0x20000000;
    encode_string( aTmp, enc, 4 );
@@ -4901,7 +6730,7 @@ IRDirty* create_dirty_RDTMP( MCEnv* mce, IRTemp tmp, IRTemp data ){
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -4947,14 +6776,14 @@ IRDirty* create_dirty_QOP( MCEnv* mce, IRTemp tmp, IROp op,
    void*    fn;
    IRExpr** args;
    IRExpr** di_args;
-   Char*    aStr;
-   Int      i, num_args = 0;
-   Int      arg_index[4];
+   HChar*   aStr;
+   Int      i; //, num_args = 0;
+   //Int      arg_index[4];
 /*   Char     aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };*/
 
-   aStr = (Char*)VG_(malloc)( "create_dirty_QOP", sizeof(Char)*128 );
+   aStr = (HChar*)VG_(malloc)( "create_dirty_QOP", sizeof(HChar)*128 );
 //   aStr = (Char*)VG_(cli_malloc)( VG_(clo_alignment), sizeof(Char)*128 );
 //   aStr = TNT_string[0x5500 | ( tmp & 0xff )];
 /*   aStr = TNT_string[ VG_(random)(0) & 0xffff ];
@@ -4962,7 +6791,8 @@ IRDirty* create_dirty_QOP( MCEnv* mce, IRTemp tmp, IROp op,
       aStr = TNT_string[ VG_(random)(0) & 0xffff ];
    }*/
 
-   VG_(sprintf)( aStr, "0x15004 t%d = %s", tmp, IROp_string[op & 0xfff]);
+   // Iop_INVALID = 0x1400
+   VG_(sprintf)( aStr, "0x15004 t%d = %s", tmp, IROp_string[op - Iop_INVALID]);
 
    args = mkIRExprVec_4( arg1, arg2, arg3, arg4);
 
@@ -4971,7 +6801,7 @@ IRDirty* create_dirty_QOP( MCEnv* mce, IRTemp tmp, IROp op,
          VG_(sprintf)( aStr, "%s 0x%x", aStr, extract_IRAtom( args[i] ) );
       else if( args[i]->tag == Iex_RdTmp ){
          VG_(sprintf)( aStr, "%s t%d", aStr, extract_IRAtom( args[i] ) );
-         arg_index[num_args++] = i;
+         //arg_index[num_args++] = i;
       }
    }
 
@@ -5024,12 +6854,12 @@ IRDirty* create_dirty_TRIOP( MCEnv* mce, IRTemp tmp, IROp op,
    IRExpr** args;
    IRExpr** di_args;
    Int      i;
-   Char*    aStr;
+   HChar*   aStr;
 /*   Char     aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };*/
 
-   aStr = (Char*)VG_(malloc)( "create_dirty_TRIOP", sizeof(Char)*128 );
+   aStr = (HChar*)VG_(malloc)( "create_dirty_TRIOP", sizeof(HChar)*128 );
 //   aStr = (Char*)VG_(cli_malloc)( VG_(clo_alignment), sizeof(Char)*128 );
 //   aStr = TNT_string[0x5400 | ( tmp & 0xff )];
 /*   aStr = TNT_string[ VG_(random)(0) & 0xffff ];
@@ -5037,7 +6867,8 @@ IRDirty* create_dirty_TRIOP( MCEnv* mce, IRTemp tmp, IROp op,
       aStr = TNT_string[ VG_(random)(0) & 0xffff ];
    }*/
 
-   VG_(sprintf)( aStr, "0x15005 t%d = %s", tmp, IROp_string[op & 0xfff]);
+   // Iop_INVALID = 0x1400
+   VG_(sprintf)( aStr, "0x15005 t%d = %s", tmp, IROp_string[op - Iop_INVALID]);
 
    args = mkIRExprVec_3( arg1, arg2, arg3);
 
@@ -5098,12 +6929,13 @@ IRDirty* create_dirty_BINOP( MCEnv* mce, IRTemp tmp, IROp op,
    Int      num_args = 0;
    IRExpr** di_args;
    Int      i;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
-   Char*    aStr;
+   HChar*   aStr;
 
-   VG_(sprintf)( aTmp, "t%d=%x ", tmp, op & 0xfff);
+   // Iop_INVALID = 0x1400
+   VG_(sprintf)( aTmp, "t%d=%x ", tmp, op - Iop_INVALID);
 
    args = mkIRExprVec_2( arg1, arg2);
 
@@ -5145,9 +6977,9 @@ IRDirty* create_dirty_BINOP( MCEnv* mce, IRTemp tmp, IROp op,
                                 convert_Value( mce, atom2vbits( mce, IRExpr_RdTmp( tmp ) ) ),
                                 convert_Value( mce, atom2vbits( mce, args[arg_index[0]] ) ) );
    }else if( mce->hWordTy == Ity_I32 && num_args == 2 ){
-      aStr = (Char*)VG_(malloc)( "create_dirty_BINOP", sizeof(Char)*128 );
+      aStr = (HChar*)VG_(malloc)( "create_dirty_BINOP", sizeof(HChar)*128 );
       VG_(sprintf)( aStr, "0x15006 t%d = %s t%d t%d", 
-                    tmp, IROp_string[op & 0xfff], 
+                    tmp, IROp_string[op - Iop_INVALID], 
                     extract_IRAtom( args[0] ), extract_IRAtom( args[1] ) );
 
       fn    = &TNT_(helperc_2_tainted);
@@ -5162,9 +6994,9 @@ IRDirty* create_dirty_BINOP( MCEnv* mce, IRTemp tmp, IROp op,
                                 convert_Value( mce, atom2vbits( mce, args[arg_index[1]] ) ) );
    }else if( mce->hWordTy == Ity_I64 && num_args == 2 ){
       // Helper function can't have num_args > 6 for 64-bits
-      aStr = (Char*)VG_(malloc)( "create_dirty_BINOP", sizeof(Char)*128 );
+      aStr = (HChar*)VG_(malloc)( "create_dirty_BINOP", sizeof(HChar)*128 );
       VG_(sprintf)( aStr, "0x15006 t%d = %s t%d t%d", 
-                    tmp, IROp_string[op & 0xfff], 
+                    tmp, IROp_string[op - Iop_INVALID], 
                     extract_IRAtom( args[0] ), extract_IRAtom( args[1] ) );
 
       fn    = &TNT_(helperc_0_tainted);
@@ -5217,17 +7049,17 @@ IRDirty* create_dirty_UNOP( MCEnv* mce, IRTemp tmp, IROp op, IRExpr* arg ){
    void*    fn;
    IRExpr** args;
    Int      num_args = 0;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
    if( arg->tag == Iex_RdTmp ){
       VG_(sprintf)( aTmp, "t%d=%x t%d!",
-                    tmp, op & 0xfff, extract_IRAtom(arg) );
+                    tmp, op - Iop_INVALID, extract_IRAtom(arg) );
       num_args++;
    }else if( arg->tag == Iex_Const ){
       VG_(sprintf)( aTmp, "t%d=%x 0x%x!",
-                    tmp, op & 0xfff, extract_IRAtom(arg) );
+                    tmp, op - Iop_INVALID, extract_IRAtom(arg) );
    }
 
    enc[0] = 0x70000000;
@@ -5299,7 +7131,7 @@ IRDirty* create_dirty_LOAD( MCEnv* mce, IRTemp tmp,
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
@@ -5353,14 +7185,14 @@ IRDirty* create_dirty_CCALL( MCEnv* mce, IRTemp tmp, IRCallee* cee, IRType retty
    HChar*   nm = "";
    void*    fn = (void *)0;
    IRExpr** di_args;
-   Int      arg_index[4];
-   Int      i, num_args = 0;
-   Char*    aStr;
+   //Int      arg_index[4];
+   Int      i; //, num_args = 0;
+   HChar*   aStr;
 //   Char     aTmp[128];
 //   UInt     enc[4] = { 0, 0, 0, 0 };
 //   ULong    enc64[2] = { 0, 0 };
 
-   aStr = (Char*)VG_(malloc)( "create_dirty_CCALL", sizeof(Char)*128 );
+   aStr = (HChar*)VG_(malloc)( "create_dirty_CCALL", sizeof(HChar)*128 );
 //   aStr = (Char*)VG_(cli_malloc)( VG_(clo_alignment), sizeof(Char)*128 );
 //   aStr = TNT_string[0x5b00 | ( tmp & 0xff )];
 /*   aStr = TNT_string[ VG_(random)(0) & 0xffff ];
@@ -5368,14 +7200,16 @@ IRDirty* create_dirty_CCALL( MCEnv* mce, IRTemp tmp, IRCallee* cee, IRType retty
       aStr = TNT_string[ VG_(random)(0) & 0xffff ];
    }*/
 
+   if ( (retty & 0xff) > 14 )
+      VG_(tool_panic)("tnt_translate.c: create_dirty_CCALL Unhandled type");
    VG_(sprintf)( aStr, "0x1500b t%d = CCALL %s %s",
-                tmp, cee->name/*, (Int)cee->addr*/, IRType_string[retty & 0xfff] );
+                tmp, cee->name/*, (Int)cee->addr*/, IRType_string[retty & 0xff] );
    for( i=0; args[i]; i++ ){
       if( args[i]->tag == Iex_Const )
          VG_(sprintf)( aStr, "%s 0x%x", aStr, extract_IRAtom( args[i] ) );
       else if( args[i]->tag == Iex_RdTmp ){
          VG_(sprintf)( aStr, "%s t%d", aStr, extract_IRAtom( args[i] ) );
-         arg_index[num_args++] = i;
+         //arg_index[num_args++] = i;
       }
    }
 //   tl_assert( num_args <= 4 );
@@ -5421,31 +7255,31 @@ IRDirty* create_dirty_CCALL( MCEnv* mce, IRTemp tmp, IRCallee* cee, IRType retty
    return unsafeIRDirty_0_N ( nargs/*regparms*/, nm,VG_(fnptr_to_fnentry)( fn ), di_args );
 }
 
-IRDirty* create_dirty_MUX0X( MCEnv* mce, IRTemp tmp,
-                             IRExpr* cond, IRExpr* expr0, IRExpr* exprX ){
-// ppIRStmt output: t<tmp> = MUX0X <cond> (<expr0>, <exprX>)
+IRDirty* create_dirty_ITE( MCEnv* mce, IRTemp tmp,
+                           IRExpr* cond, IRExpr* iftrue, IRExpr* iffalse ){
+// ppIRStmt output: t<tmp> = ITE <cond> (<iftrue>, <iffalse>)
    Int      nargs = 3;
    HChar*   nm;
    void*    fn;
    IRExpr** args;
-   IRExpr** mux_args;
+   IRExpr** ite_args;
    Int      i;
-   Char     aTmp[128];
+   HChar    aTmp[128];
    UInt     enc[4] = { 0, 0, 0, 0 };
    ULong    enc64[2] = { 0, 0 };
 
-   mux_args = mkIRExprVec_3( cond, expr0, exprX );
+   ite_args = mkIRExprVec_3( cond, iftrue, iffalse );
 
-   if( mux_args[0]->tag == Iex_Const )
-      VG_(sprintf)( aTmp, "t%d=0x%x", tmp, extract_IRAtom( mux_args[0] ) );
-   else if( mux_args[0]->tag == Iex_RdTmp )
-      VG_(sprintf)( aTmp, "t%d=t%d", tmp, extract_IRAtom( mux_args[0] ) );
+   if( ite_args[0]->tag == Iex_Const )
+      VG_(sprintf)( aTmp, "t%d=0x%x", tmp, extract_IRAtom( ite_args[0] ) );
+   else if( ite_args[0]->tag == Iex_RdTmp )
+      VG_(sprintf)( aTmp, "t%d=t%d", tmp, extract_IRAtom( ite_args[0] ) );
 
    for(i=1; i<3; i++){
-      if( mux_args[i]->tag == Iex_Const )
-         VG_(sprintf)( aTmp, "%s 0x%x", aTmp, extract_IRAtom( mux_args[i] ) );
-      else if( mux_args[i]->tag == Iex_RdTmp )
-         VG_(sprintf)( aTmp, "%s t%d", aTmp, extract_IRAtom( mux_args[i] ) );
+      if( ite_args[i]->tag == Iex_Const )
+         VG_(sprintf)( aTmp, "%s 0x%x", aTmp, extract_IRAtom( ite_args[i] ) );
+      else if( ite_args[i]->tag == Iex_RdTmp )
+         VG_(sprintf)( aTmp, "%s t%d", aTmp, extract_IRAtom( ite_args[i] ) );
    }
    VG_(sprintf)( aTmp, "%s!", aTmp );
 
@@ -5476,7 +7310,7 @@ IRDirty* create_dirty_MUX0X( MCEnv* mce, IRTemp tmp,
                              convert_Value( mce, IRExpr_RdTmp(tmp) ),
                              convert_Value( mce, atom2vbits( mce, IRExpr_RdTmp(tmp) ) ) );
    }else
-      VG_(tool_panic)("tnt_translate.c: create_dirty_MUX0X: Unknown platform");
+      VG_(tool_panic)("tnt_translate.c: create_dirty_ITE: Unknown platform");
 
    return unsafeIRDirty_0_N ( nargs/*regparms*/, nm,VG_(fnptr_to_fnentry)( fn ), args );
 }
@@ -5556,6 +7390,7 @@ IRSB* TNT_(instrument)( VgCallbackClosure* closure,
                         IRSB* sb_in,
                         VexGuestLayout* layout, 
                         VexGuestExtents* vge,
+                        VexArchInfo* vai,
                         IRType gWordTy, IRType hWordTy )
 {
    Bool    verboze = 0||False;
@@ -5687,6 +7522,20 @@ typedef
    mce.layout         = layout;
    mce.hWordTy        = hWordTy;
    mce.bogusLiterals  = False;
+
+   /* Do expensive interpretation for Iop_Add32 and Iop_Add64 on
+      Darwin.  10.7 is mostly built with LLVM, which uses these for
+      bitfield inserts, and we get a lot of false errors if the cheap
+      interpretation is used, alas.  Could solve this much better if
+      we knew which of such adds came from x86/amd64 LEA instructions,
+      since these are the only ones really needing the expensive
+      interpretation, but that would require some way to tag them in
+      the _toIR.c front ends, which is a lot of faffing around.  So
+      for now just use the slow and blunt-instrument solution. */
+   mce.useLLVMworkarounds = False;
+#  if defined(VGO_darwin)
+   mce.useLLVMworkarounds = True;
+#  endif
 
    mce.tmpMap = VG_(newXA)( VG_(malloc), "mc.TNT_(instrument).1", VG_(free),
                             sizeof(TempMapEnt));

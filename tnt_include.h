@@ -144,15 +144,15 @@ void TNT_(helperc_MAKE_STACK_UNINIT) ( Addr base, UWord len,
                                                  Addr nia );
 
 /* Taintgrind args */
-extern Char* TNT_(clo_file_filter);
-extern Int   TNT_(clo_taint_start);
-extern Int   TNT_(clo_taint_len);
-extern Bool  TNT_(clo_taint_all);
-extern Int   TNT_(clo_after_bb);
-extern Int   TNT_(clo_before_bb);
-extern Bool  TNT_(clo_tainted_ins_only);
-extern Bool  TNT_(clo_critical_ins_only);
-extern Int   TNT_(do_print);
+extern HChar* TNT_(clo_file_filter);
+extern Int    TNT_(clo_taint_start);
+extern Int    TNT_(clo_taint_len);
+extern Bool   TNT_(clo_taint_all);
+extern Int    TNT_(clo_after_bb);
+extern Int    TNT_(clo_before_bb);
+extern Bool   TNT_(clo_tainted_ins_only);
+extern Bool   TNT_(clo_critical_ins_only);
+extern Int    TNT_(do_print);
 //extern Char* TNT_(clo_allowed_syscalls);
 //extern Bool  TNT_(read_syscalls_file);
 
@@ -261,6 +261,7 @@ IRSB* TNT_(instrument)( VgCallbackClosure* closure,
                         IRSB* bb_in,
                         VexGuestLayout* layout,
                         VexGuestExtents* vge,
+                        VexArchInfo* vai,
                         IRType gWordTy, IRType hWordTy );
 
 
@@ -268,7 +269,7 @@ IRSB* TNT_(instrument)( VgCallbackClosure* closure,
 extern Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret );
 
 /* SOAAP-related data */
-extern Char* client_binary_name;
+extern HChar* client_binary_name;
 #define FNNAME_MAX 100
 
 extern UInt persistent_sandbox_nesting_depth;
@@ -292,7 +293,7 @@ enum VariableLocation { GlobalFromApplication = 5, GlobalFromElsewhere = 6 };
 
 extern struct myStringArray shared_vars;
 extern UInt shared_vars_perms[];
-extern Char* next_shared_variable_to_update;
+extern HChar* next_shared_variable_to_update;
 
 #define IN_SANDBOX (persistent_sandbox_nesting_depth > 0 || ephemeral_sandbox_nesting_depth > 0)
 
@@ -310,10 +311,10 @@ extern UInt callgate_nesting_depth;
 extern const char* syscallnames[];
 
 /* Utility functions */
-extern void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum VariableType* type, enum VariableLocation* loc);
+extern void TNT_(describe_data)(Addr addr, HChar* varnamebuf, UInt bufsize, enum VariableType* type, enum VariableLocation* loc);
 extern void TNT_(get_fnname)(ThreadId tid, HChar* buf, UInt buf_size);
 extern void TNT_(check_fd_access)(ThreadId tid, UInt fd, Int fd_request);
-extern void TNT_(check_var_access)(ThreadId tid, Char* varname, Int var_request, enum VariableType type, enum VariableLocation var_loc);
+extern void TNT_(check_var_access)(ThreadId tid, HChar* varname, Int var_request, enum VariableType type, enum VariableLocation var_loc);
 
 #endif /* ndef __TNT_INCLUDE_H */
 

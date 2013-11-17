@@ -149,19 +149,19 @@ static INLINE Bool is_distinguished_sm ( SecMap* sm ) {
 }
 
 // Forward declaration
-Int  ctoi( Char c );
-Int  ctoi_test( Char c );
-Int  atoi( Char *s );
+Int  ctoi( HChar c );
+Int  ctoi_test( HChar c );
+Int  atoi( HChar *s );
 Char decode_char( UInt num );
-void decode_string( UInt *enc, Char *aStr );
-void post_decode_string( Char *aStr );
-void post_decode_string_load( Char *aStr );
-void post_decode_string_primops( Char *aStr );
-void post_decode_string_binops( Char *aStr );
-void post_decode_string_store( Char *aStr );
-void post_decode_string_mux0x( Char *aStr );
-Int get_and_check_reg( Char *reg );
-Int get_and_check_tvar( Char *tmp );
+void decode_string( UInt *enc, HChar *aStr );
+void post_decode_string( HChar *aStr );
+void post_decode_string_load( HChar *aStr );
+void post_decode_string_primops( HChar *aStr );
+void post_decode_string_binops( HChar *aStr );
+void post_decode_string_store( HChar *aStr );
+void post_decode_string_ite( HChar *aStr );
+Int get_and_check_reg( HChar *reg );
+Int get_and_check_tvar( HChar *tmp );
 
 static void update_SM_counts(SecMap* oldSM, SecMap* newSM); //285
 
@@ -807,7 +807,7 @@ static void gcSecVBitTable(void)
    secVBitTable = secVBitTable2;
 
    if (VG_(clo_verbosity) > 1) {
-      Char percbuf[6];
+      HChar percbuf[6];
       VG_(percentify)(n_survivors, n_nodes, 1, 6, percbuf);
       VG_(message)(Vg_DebugMsg, "tnt_main.c: GC: %d nodes, %d survivors (%s)\n",
                    n_nodes, n_survivors, percbuf);
@@ -2139,7 +2139,7 @@ void TNT_(helperc_STOREV8) ( Addr a, UWord vbits8 )
 #endif
 }
 
-Int ctoi_test( Char c ){
+Int ctoi_test( HChar c ){
    switch(c){
    case '0':
    case '1':
@@ -2169,7 +2169,7 @@ Int ctoi_test( Char c ){
    }
 }
 
-Int ctoi( Char c ){
+Int ctoi( HChar c ){
    tl_assert( ctoi_test(c) );
 
    switch(c){
@@ -2219,7 +2219,7 @@ Int ctoi( Char c ){
    return -1; // unreachable
 }
 
-Int atoi( Char *s ){
+Int atoi( HChar *s ){
    Int result = 0;
    Int multiplier = 1;
    Int i;
@@ -2303,7 +2303,7 @@ Char decode_char( UInt num ){
    }
 }
 
-void decode_string( UInt *enc, Char *aStr ){
+void decode_string( UInt *enc, HChar *aStr ){
    Int start = 5;
    Int next_uint;
    Int shift;
@@ -2333,12 +2333,12 @@ void decode_string( UInt *enc, Char *aStr ){
    }
 }
 
-void post_decode_string_load( Char *aStr ){
-   Char aTmp1[128];
-   Char aTmp2[128];
+void post_decode_string_load( HChar *aStr ){
+   HChar aTmp1[128];
+   HChar aTmp2[128];
    Int i;
    Int irtype;
-   Char *pChr;
+   HChar *pChr;
 
    pChr = VG_(strchr)( aStr, '=' );
 
@@ -2370,10 +2370,10 @@ void post_decode_string_load( Char *aStr ){
    VG_(sprintf)( aStr, "%s LD %s %s", aTmp1, IRType_string[irtype & 0xf], aTmp2 );
 }
 
-void post_decode_string_primops( Char *aStr ){
-   Char aTmp1[128];
-   Char aTmp2[128];
-   Char *pChr;
+void post_decode_string_primops( HChar *aStr ){
+   HChar aTmp1[128];
+   HChar aTmp2[128];
+   HChar *pChr;
    Int i;
    Int irop;
 
@@ -2411,9 +2411,10 @@ void post_decode_string_primops( Char *aStr ){
       tl_assert(0);
    }
 
-   if( irop > 707 ){
-      VG_(printf)("%s\n", aStr);
-      tl_assert( irop <= 707 );
+   // 1st: Iop_INVALID, Last: Iop_LAST
+   if( irop >= (Iop_LAST - Iop_INVALID) ){
+      VG_(printf)("%s irop:%x Iop_LAST:%x\n", aStr, irop, Iop_LAST);
+      tl_assert( 0 );
    }
 
    VG_(strncpy)( aTmp2, aStr+i+1, 127 );
@@ -2425,12 +2426,12 @@ void post_decode_string_primops( Char *aStr ){
    VG_(sprintf)( aStr, "%s %s %s", aTmp1, IROp_string[irop & 0xfff], aTmp2 );
 }
 
-void post_decode_string_binops( Char *aStr ){
-   Char aTmp1[128];
-   Char aTmp2[128];
-   Char aTmp3[128];
-   Char *pEquals, *pSpace;
-   Char *pTempVar, *pHex;
+void post_decode_string_binops( HChar *aStr ){
+   HChar aTmp1[128];
+   HChar aTmp2[128];
+   HChar aTmp3[128];
+   HChar *pEquals, *pSpace;
+   HChar *pTempVar, *pHex;
 
    // 0x15006 t20 = irop t25x1
    //             ^--pEquals
@@ -2492,13 +2493,13 @@ void post_decode_string_binops( Char *aStr ){
    }
 }
 
-void post_decode_string_store( Char *aStr ){
-   Char aTmp1[128];
-   Char aTmp2[128];
-   Char aTmp3[8];
+void post_decode_string_store( HChar *aStr ){
+   HChar aTmp1[128];
+   HChar aTmp2[128];
+   HChar aTmp3[8];
    Int i;
    Int irtype;
-   Char *pChr;
+   HChar *pChr;
 
    VG_(strncpy)( aTmp3, aStr, 7 );
    aTmp3[7] = '\0';
@@ -2536,10 +2537,10 @@ void post_decode_string_store( Char *aStr ){
       aTmp3, aTmp1, aTmp2, IRType_string[irtype & 0xf] );
 }
 
-void post_decode_string_mux0x( Char *aStr ){
-   Char aTmp1[128];
-   Char aTmp2[128];
-   Char *pChr;
+void post_decode_string_ite( HChar *aStr ){
+   HChar aTmp1[128];
+   HChar aTmp2[128];
+   HChar *pChr;
 
    pChr = VG_(strchr)( aStr, '=' );
 
@@ -2553,11 +2554,11 @@ void post_decode_string_mux0x( Char *aStr ){
               7 +
               VG_(strlen)( aTmp2 ) < 128 );
 
-   VG_(sprintf)( aStr, "%s MUX0X %s", aTmp1, aTmp2 );
+   VG_(sprintf)( aStr, "%s ITE %s", aTmp1, aTmp2 );
 }
 
-void post_decode_string( Char *aStr ){
-   Char aTmp[128];
+void post_decode_string( HChar *aStr ){
+   HChar aTmp[128];
    Int i;
    Int count = 0;
 
@@ -2587,7 +2588,7 @@ void post_decode_string( Char *aStr ){
    }else if( aStr[3] == '5' && aStr[6] == '8' ){
       post_decode_string_load( aStr );
    }else if( aStr[3] == '5' && aStr[6] == 'A' ){
-      post_decode_string_mux0x( aStr );
+      post_decode_string_ite( aStr );
    }else if( aStr[3] == '9' && aStr[6] == '6' ){
       post_decode_string_store( aStr );
    }
@@ -2615,7 +2616,7 @@ int lvar_i[STACK_SIZE];
 ////////////////////////////////
 // Start of SOAAP-related data
 ////////////////////////////////
-Char* client_binary_name = NULL;
+HChar* client_binary_name = NULL;
 
 UInt shared_fds[FD_MAX];
 UInt persistent_sandbox_nesting_depth = 0;
@@ -2624,7 +2625,7 @@ Bool have_created_sandbox = False;
 
 struct myStringArray shared_vars;
 UInt shared_vars_perms[VAR_MAX];
-Char* next_shared_variable_to_update = NULL;
+HChar* next_shared_variable_to_update = NULL;
 
 Bool allowed_syscalls[SYSCALLS_MAX];
 
@@ -2633,7 +2634,7 @@ UInt callgate_nesting_depth = 0;
 // End of SOAAP-related data
 ////////////////////////////////
 
-Int get_and_check_reg( Char *reg ){
+Int get_and_check_reg( HChar *reg ){
 
    Int regnum = atoi( reg );
 //   if( regnum % 4 ){
@@ -2648,7 +2649,7 @@ Int get_and_check_reg( Char *reg ){
    return regnum;
 }
 
-Int get_and_check_tvar( Char *tmp ){
+Int get_and_check_tvar( HChar *tmp ){
 
    Int tmpnum = atoi( tmp );
    tl_assert( tmpnum < TVAR_I_MAX );
@@ -2661,7 +2662,7 @@ void infer_client_binary_name(UInt pc) {
       DebugInfo* di = VG_(find_DebugInfo)(pc);
       if (di && VG_(strcmp)(VG_(DebugInfo_get_soname)(di), "NONE") == 0) {
          VG_(printf)("client_binary_name: %s\n", VG_(DebugInfo_get_filename)(di));
-         client_binary_name = (Char*)VG_(malloc)("client_binary_name",sizeof(Char)*(VG_(strlen)(VG_(DebugInfo_get_filename)(di)+1)));
+         client_binary_name = (HChar*)VG_(malloc)("client_binary_name",sizeof(HChar)*(VG_(strlen)(VG_(DebugInfo_get_filename)(di)+1)));
          VG_(strcpy)(client_binary_name, VG_(DebugInfo_get_filename)(di));
       }  
    }
@@ -2678,8 +2679,8 @@ void TNT_(helperc_0_tainted_enc32) (
    UInt taint ) {
 
    UInt  pc; 
-   Char  fnname[FNNAME_MAX];
-   Char  aTmp[128];
+   HChar fnname[FNNAME_MAX];
+   HChar aTmp[128];
    UInt  enc[4] = { enc0, enc1, enc2, enc3 };
 
    pc = VG_(get_IP)( VG_(get_running_tid)() );
@@ -2705,8 +2706,8 @@ void TNT_(helperc_0_tainted_enc32) (
 
          if( VG_(strstr)( aTmp, " get " ) != NULL /*&& taint*/ ){
 
-            Char *pTmp, *pEquals, *pGet, *pSpace, *pReg;
-            Char reg[16], tmp[16];
+            HChar *pTmp, *pEquals, *pGet, *pSpace, *pReg;
+            HChar reg[16], tmp[16];
   
             // 0x15001 t53 = get 0 i8
             //         ^--pTmp
@@ -2733,8 +2734,8 @@ void TNT_(helperc_0_tainted_enc32) (
 
          }else if( VG_(strstr)( aTmp, " put " ) != NULL /*&& taint*/ ){
 
-            Char *pPut, *pSpace, *pReg;
-            Char reg[16], tmp[16];
+            HChar *pPut, *pSpace, *pReg;
+            HChar reg[16], tmp[16];
   
             // 0x19003 put 28 = t24
             //        ^--pPut
@@ -2772,8 +2773,8 @@ void TNT_(helperc_0_tainted_enc32) (
             }
 
          }else/* if( taint )*/{
-            Char *pTmp1, *pTmp2, *pEquals;
-            Char tmp1[16], tmp2[16];
+            HChar *pTmp1, *pTmp2, *pEquals;
+            HChar tmp1[16], tmp2[16];
 
             // 0x15003 t28 = t61
             //          ^--pTmp1
@@ -2818,9 +2819,9 @@ void TNT_(helperc_0_tainted_enc64) (
    ULong value, 
    ULong taint ) {
 
-   ULong  pc; 
-   Char  fnname[FNNAME_MAX];
-   Char  aTmp[128];
+   ULong pc; 
+   HChar fnname[FNNAME_MAX];
+   HChar aTmp[128];
    UInt  enc[4] = { (UInt)(enc0 >> 32), (UInt)(enc0 & 0xffffffff),
                     (UInt)(enc1 >> 32), (UInt)(enc1 & 0xffffffff) };
 
@@ -2846,8 +2847,8 @@ void TNT_(helperc_0_tainted_enc64) (
          // Information flow
          if( VG_(strstr)( aTmp, " get " ) != NULL /*&& taint*/ ){
 
-            Char *pTmp, *pEquals, *pGet, *pSpace, *pReg;
-            Char reg[16], tmp[16];
+            HChar *pTmp, *pEquals, *pGet, *pSpace, *pReg;
+            HChar reg[16], tmp[16];
   
             // 0x15001 t53 = get 0 i8
             //          ^--pTmp
@@ -2873,8 +2874,8 @@ void TNT_(helperc_0_tainted_enc64) (
             VG_(printf)( "t%s.%d <- r%s.%d", tmp, tvar_i[tmpnum], reg, reg_i[regnum] );
          }else if( VG_(strstr)( aTmp, " put " ) != NULL /*&& taint*/ ){
 
-            Char *pPut, *pSpace, *pReg;
-            Char reg[16], tmp[16];
+            HChar *pPut, *pSpace, *pReg;
+            HChar reg[16], tmp[16];
   
             // 0x19003 put 28 = t24
             //        ^--pPut
@@ -2912,8 +2913,8 @@ void TNT_(helperc_0_tainted_enc64) (
             }
 
          }else /*if( taint )*/{
-            Char *pTmp1, *pTmp2, *pEquals;
-            Char tmp1[16], tmp2[16];
+            HChar *pTmp1, *pTmp2, *pEquals;
+            HChar tmp1[16], tmp2[16];
 
             // 0x15003 t28 = t61
             //          ^--pTmp1
@@ -2962,7 +2963,7 @@ void TNT_(helperc_1_tainted_enc32) (
    UInt taint1, 
    UInt taint2 ) {
 
-   Char  aTmp[128];
+   HChar aTmp[128];
    UInt  enc[4] = { enc0, enc1, enc2/*0xffffffff*/, 0xffffffff };
 
    ThreadId tid = VG_(get_running_tid());
@@ -2975,11 +2976,12 @@ void TNT_(helperc_1_tainted_enc32) (
    //VG_(printf)("decoded string %s\n", aTmp);
    post_decode_string( aTmp );
 
-   Char varname[256];
+   HChar varname[256];
    VG_(memset)( varname, 0, 255 );
 
    HChar fnname[FNNAME_MAX];
-   TNT_(get_fnname)(tid, fnname, FNNAME_MAX);
+   //TNT_(get_fnname)(tid, fnname, FNNAME_MAX);
+   VG_(describe_IP)(pc, fnname, FNNAME_MAX);
 
    enum VariableType type = 0;
    enum VariableLocation var_loc;
@@ -3045,8 +3047,8 @@ void TNT_(helperc_1_tainted_enc32) (
                myStringArray_push( &lvar_s, varname );
             }
 
-            Char *pTmp, *pEquals;
-            Char tmp[16];
+            HChar *pTmp, *pEquals;
+            HChar tmp[16];
 
             // 0x15008 t35 = LD I32 0x805badc
             //         ^--pTmp
@@ -3064,9 +3066,9 @@ void TNT_(helperc_1_tainted_enc32) (
             VG_(printf)( "(%d) t%s.%d <- %s.%d", type, tmp, tvar_i[tmpnum], varname, lvar_i[ myStringArray_getIndex( &lvar_s, varname ) ] );
 
             // Pointer tainting
-            Char *pTmp2 = VG_(strstr)( pTmp + 1, " t" );
+            HChar *pTmp2 = VG_(strstr)( pTmp + 1, " t" );
             if( pTmp2 != NULL ){
-               Char tmp2[16];
+               HChar tmp2[16];
                pTmp2 += 2;
             // 0x15008 t35 = LD I32 t34
             //                      ^--pTmp2
@@ -3079,7 +3081,7 @@ void TNT_(helperc_1_tainted_enc32) (
             	// loading from hardcoded address
             	pTmp2 = VG_(strstr)( pTmp + 1, " 0x" );
             	if (pTmp2 != NULL) {
-					Char tmp2[16];
+					HChar tmp2[16];
 					pTmp2 += 1;
             	// 0x15008 t4 = LD I32 0x80a42e0
 				 //                   ^--pTmp2
@@ -3108,8 +3110,8 @@ void TNT_(helperc_1_tainted_enc32) (
             }
             lvar_i[ myStringArray_getIndex( &lvar_s, varname ) ]++;
 
-            Char *pEquals, *pTmp, *pSpace;
-            Char tmp[16];
+            HChar *pEquals, *pTmp, *pSpace;
+            HChar tmp[16];
 
             // 0x19006 ST t80 = t85 I16
             //               ^--pEquals
@@ -3129,9 +3131,9 @@ void TNT_(helperc_1_tainted_enc32) (
                VG_(printf)( "(%d) %s.%d <- t%s.%d", type, varname, lvar_i[ myStringArray_getIndex( &lvar_s, varname ) ], tmp, tvar_i[tmpnum] );
 
                // Pointer tainting
-               Char *pTmp2 = VG_(strstr)( aTmp, " t" );
+               HChar *pTmp2 = VG_(strstr)( aTmp, " t" );
                if( pTmp2 != NULL && pTmp2 < pEquals ){
-                  Char tmp2[16];
+                  HChar tmp2[16];
                   pTmp2 += 2;
                // 0x15008 ST t35 = t34 I32
                //             ^--pTmp2
@@ -3145,10 +3147,10 @@ void TNT_(helperc_1_tainted_enc32) (
             	  // 0x19006 ST 0x80ac360 = t18 I32
             	  //        ^--pAddr
             	  //           ^--pTmp2
-            	  Char *pAddr = VG_(strstr)( aTmp, " ST " );
+            	  HChar *pAddr = VG_(strstr)( aTmp, " ST " );
             	  pTmp2 = VG_(strstr)( pAddr, " 0x" );
             	  if (pTmp2 != NULL) {
-            		  Char tmp2[16];
+            		  HChar tmp2[16];
             		  pTmp2 += 1;
             		  // 0x15008 ST t35 = t34 I32
             		  //             ^--pTmp2
@@ -3164,8 +3166,8 @@ void TNT_(helperc_1_tainted_enc32) (
             }
 
          }else /*if( taint1 && taint2 )*/{
-            Char *pTmp1, *pTmp2, *pEquals, *pHex, *pSpace;
-            Char tmp1[16], tmp2[16];
+            HChar *pTmp1, *pTmp2, *pEquals, *pHex, *pSpace;
+            HChar tmp1[16], tmp2[16];
 
             // 0x15006 t7 = Shl32 t35 0x5
             //         ^--pTmp1   ^--pTmp2
@@ -3217,10 +3219,10 @@ void TNT_(helperc_1_tainted_enc64) (
    ULong taint2 ) {
 
    ULong  pc; 
-   Char  fnname[FNNAME_MAX];
-   Char  aTmp[128];
-   UInt  enc[4] = { (UInt)(enc0 >> 32), (UInt)(enc0 & 0xffffffff),
-                    (UInt)(enc1 >> 32), (UInt)(enc1 & 0xffffffff) };
+   HChar  fnname[FNNAME_MAX];
+   HChar  aTmp[128];
+   UInt   enc[4] = { (UInt)(enc0 >> 32), (UInt)(enc0 & 0xffffffff),
+                     (UInt)(enc1 >> 32), (UInt)(enc1 & 0xffffffff) };
 
    if( TNT_(clo_critical_ins_only) &&
        ( enc[0] & 0xf8000000 ) != 0x68000000 &&
@@ -3257,7 +3259,7 @@ void TNT_(helperc_1_tainted_enc64) (
 
          // Information flow
          if( VG_(strstr)( aTmp, " LD " ) != NULL /*&& taint1*/ ){
-            Char objname[256];
+            HChar objname[256];
 //            PtrdiffT pdt;
             VG_(memset)( objname, 0, 255 );
 //            VG_(get_datasym_and_offset)( value2, objname, 255, &pdt );
@@ -3274,8 +3276,8 @@ void TNT_(helperc_1_tainted_enc64) (
                myStringArray_push( &lvar_s, objname );
             }
 
-            Char *pTmp, *pEquals;
-            Char tmp[16];
+            HChar *pTmp, *pEquals;
+            HChar tmp[16];
 
             // 0x15008 t35 = LD I32 0x805badc
             //          ^--pTmp
@@ -3293,9 +3295,9 @@ void TNT_(helperc_1_tainted_enc64) (
             VG_(printf)( "(%d) t%s.%d <- %s.%d", type, tmp, tvar_i[tmpnum], objname, lvar_i[ myStringArray_getIndex( &lvar_s, objname ) ] );
 
             // Pointer tainting
-            Char *pTmp2 = VG_(strstr)( pTmp + 1, " t" );
+            HChar *pTmp2 = VG_(strstr)( pTmp + 1, " t" );
             if( pTmp2 != NULL ){
-               Char tmp2[16];
+               HChar tmp2[16];
                pTmp2 += 2;
             // 0x15008 t35 = LD I32 t34
             //                      ^--pTmp2
@@ -3306,7 +3308,7 @@ void TNT_(helperc_1_tainted_enc64) (
             }
 
          }else if( VG_(strstr)( aTmp, " ST " ) != NULL /*&& taint2*/ ){
-            Char objname[256];
+            HChar objname[256];
 //            PtrdiffT pdt;
             VG_(memset)( objname, 0, 255 );
 //            VG_(get_datasym_and_offset)( value1, objname, 255, &pdt );
@@ -3324,8 +3326,8 @@ void TNT_(helperc_1_tainted_enc64) (
             }
             lvar_i[ myStringArray_getIndex( &lvar_s, objname ) ]++;
 
-            Char *pEquals, *pTmp, *pSpace;
-            Char tmp[16];
+            HChar *pEquals, *pTmp, *pSpace;
+            HChar tmp[16];
 
             // 0x19006 ST t80 = t85 I16
             //               ^--pEquals
@@ -3345,9 +3347,9 @@ void TNT_(helperc_1_tainted_enc64) (
                VG_(printf)( "(%d) %s.%d <- t%s.%d", type, objname, lvar_i[ myStringArray_getIndex( &lvar_s, objname ) ], tmp, tvar_i[tmpnum] );
 
                // Pointer tainting
-               Char *pTmp2 = VG_(strstr)( aTmp, " t" );
+               HChar *pTmp2 = VG_(strstr)( aTmp, " t" );
                if( pTmp2 != NULL && pTmp2 < pEquals ){
-                  Char tmp2[16];
+                  HChar tmp2[16];
                   pTmp2 += 2;
                // 0x15008 ST t35 = t34 I32
                //             ^--pTmp2
@@ -3363,8 +3365,8 @@ void TNT_(helperc_1_tainted_enc64) (
             }
 
          }else /*if( taint1 && taint2 )*/{
-            Char *pTmp1, *pTmp2, *pEquals, *pHex, *pSpace;
-            Char tmp1[16], tmp2[16];
+            HChar *pTmp1, *pTmp2, *pEquals, *pHex, *pSpace;
+            HChar tmp1[16], tmp2[16];
 
             // 0x15006 t7 = Shl32 t35 0x5
             //          ^--pTmp1   ^--pTmp2
@@ -3413,7 +3415,7 @@ void TNT_(helperc_0_tainted) (
    UInt taint ) {
 
    UInt  pc; 
-   Char  fnname[FNNAME_MAX];
+   HChar fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3430,8 +3432,8 @@ void TNT_(helperc_0_tainted) (
 
          // Information flow
          if( VG_(strstr)( str, "0x15006" ) != NULL /*&& taint*/ ){
-            Char *pTmp1, *pTmp2, *pTmp3, *pEquals;
-            Char tmp1[16], tmp2[16], tmp3[16];
+            HChar *pTmp1, *pTmp2, *pTmp3, *pEquals;
+            HChar tmp1[16], tmp2[16], tmp3[16];
 
             // 0x15006 t81 = Add32 t20 t20
             //          ^--pTmp1    ^--pTmp2
@@ -3457,8 +3459,8 @@ void TNT_(helperc_0_tainted) (
 
             VG_(printf)( "t%s.%d <- t%s.%d; t%s.%d <- t%s.%d", tmp1, tvar_i[tmpnum1], tmp2, tvar_i[tmpnum2], tmp1, tvar_i[tmpnum1], tmp3, tvar_i[tmpnum3] );
          }else if( VG_(strstr)( str, " = " ) != NULL ){
-            Char *pTmp, *pEquals;
-            Char tmp[16];
+            HChar *pTmp, *pEquals;
+            HChar tmp[16];
             pTmp = VG_(strstr)( str, " t" ); pTmp += 2;
             pEquals = VG_(strstr)( str, " = " );
             VG_(strncpy)( tmp, pTmp, pEquals-pTmp );
@@ -3483,7 +3485,7 @@ void TNT_(helperc_1_tainted) (
    UInt taint2 ) {
 
    UInt  pc; 
-   Char  fnname[FNNAME_MAX];
+   HChar fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3514,7 +3516,7 @@ void TNT_(helperc_2_tainted) (
    UInt taint3 ) {
 
    UInt  pc;
-   Char  fnname[FNNAME_MAX];
+   HChar fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3533,8 +3535,8 @@ void TNT_(helperc_2_tainted) (
 
          // Information flow
          if( VG_(strstr)( str, "0x15006" ) != NULL /*&& taint1*/ ){
-            Char *pTmp1, *pTmp2, *pTmp3, *pEquals;
-            Char tmp1[16], tmp2[16], tmp3[16];
+            HChar *pTmp1, *pTmp2, *pTmp3, *pEquals;
+            HChar tmp1[16], tmp2[16], tmp3[16];
 
             // 0x15006 t81 = Add32 t20 t20
             //          ^--pTmp1    ^--pTmp2
@@ -3582,7 +3584,7 @@ void TNT_(helperc_3_tainted) (
    UInt taint ) {
 
    UInt  pc;
-   Char  fnname[FNNAME_MAX];
+   HChar fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3613,7 +3615,7 @@ void TNT_(helperc_4_tainted) (
    UInt taint ) {
 
    UInt  pc;
-   Char  fnname[FNNAME_MAX];
+   HChar fnname[FNNAME_MAX];
 
    if( TNT_(clo_critical_ins_only) )
       return;
@@ -3638,7 +3640,7 @@ void TNT_(helperc_4_tainted) (
 /*--- name from data address, using debug symbol tables.   ---*/
 /*------------------------------------------------------------*/
 
-void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum VariableType* type, enum VariableLocation* loc) {
+void TNT_(describe_data)(Addr addr, HChar* varnamebuf, UInt bufsize, enum VariableType* type, enum VariableLocation* loc) {
 
 
 	// first try to see if it is a global var
@@ -3781,7 +3783,7 @@ void TNT_(describe_data)(Addr addr, Char* varnamebuf, UInt bufsize, enum Variabl
       //VG_(printf)("var: %s, di: %d\n", varnamebuf, di);
       
 			UInt pc = VG_(get_IP)(VG_(get_running_tid)());
-			Char binarynamebuf[1024];
+			HChar binarynamebuf[1024];
 			VG_(get_objname)(pc, binarynamebuf, 1024);
       //VG_(printf)("var: %s, declaring binary: %s, client binary: %s\n", varnamebuf, binarynamebuf, client_binary_name);
 			*loc = (VG_(strcmp)(binarynamebuf, client_binary_name) == 0 && VG_(strstr)(varnamebuf, "@@") == NULL) ? GlobalFromApplication : GlobalFromElsewhere;
@@ -3971,7 +3973,7 @@ Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret ) {
 			break;
 		}
 		case VG_USERREQ__TAINTGRIND_SHARED_VAR: {
-			Char* var = (Char*)arg[1];
+			HChar* var = (HChar*)arg[1];
 			Int perm = arg[2];
 			Int var_idx = myStringArray_push(&shared_vars, var);
 			VAR_SET_PERMISSION(var_idx, perm);
@@ -3980,7 +3982,7 @@ Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret ) {
 		case VG_USERREQ__TAINTGRIND_UPDATE_SHARED_VAR: {
 			// record next shared var to be updated so that we can
 			// check that the user has annotated a global variable write
-			next_shared_variable_to_update = (Char*)arg[1];
+			next_shared_variable_to_update = (HChar*)arg[1];
 			break;
 		}
 		case VG_USERREQ__TAINTGRIND_ALLOW_SYSCALL: {
@@ -4005,7 +4007,7 @@ Bool TNT_(handle_client_requests) ( ThreadId tid, UWord* arg, UWord* ret ) {
 */
 
 //static Char   TNT_(default_file_filter)[]      = "";
-Char*         TNT_(clo_file_filter)            = "";
+HChar*        TNT_(clo_file_filter)            = "";
 Int           TNT_(clo_taint_start)            = 0;
 Int           TNT_(clo_taint_len)              = 0x800000;
 Bool          TNT_(clo_taint_all)              = False;
@@ -4017,7 +4019,9 @@ Int           TNT_(do_print)                   = 0;
 //Char*         TNT_(clo_allowed_syscalls)       = "";
 //Bool          TNT_(read_syscalls_file)         = False;
 
-static Bool tnt_process_cmd_line_options(Char* arg) {
+void init_soaap_data(void);
+
+static Bool tnt_process_cmd_line_options(HChar* arg) {
    if VG_STR_CLO(arg, "--file-filter", TNT_(clo_file_filter)) {
       TNT_(do_print) = 0;
    }
@@ -4167,15 +4171,15 @@ static void tnt_pre_clo_init(void)
 
 VG_DETERMINE_INTERFACE_VERSION(tnt_pre_clo_init)
 
-void TNT_(check_var_access)(ThreadId tid, Char* varname, Int var_request, enum VariableType type, enum VariableLocation var_loc) {
+void TNT_(check_var_access)(ThreadId tid, HChar* varname, Int var_request, enum VariableType type, enum VariableLocation var_loc) {
 	if (type == Global && var_loc == GlobalFromApplication) {
-		Char  fnname[FNNAME_MAX];
+		HChar fnname[FNNAME_MAX];
 		TNT_(get_fnname)(tid, fnname, FNNAME_MAX);
 		Int var_idx = myStringArray_getIndex(&shared_vars, varname);
 		// first check if this access is allowed
 		Bool allowed = var_idx != -1 && (shared_vars_perms[var_idx] & var_request);
 		if (IN_SANDBOX && !allowed) {
-			Char* access_str;
+			HChar* access_str;
 			switch (var_request) {
 				case VAR_READ: {
 					access_str = "read";
