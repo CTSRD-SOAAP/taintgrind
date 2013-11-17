@@ -6,23 +6,23 @@ This text is available in Czech at http://czlib.bizcow.com/post/taintgrind-a-val
 Installation
 ------------
 
-1. Download Valgrind from http://valgrind.org and build
+1. Download [Valgrind](http://valgrind.org) and build
 
 
-	[me@machine ~/] tar jxvf valgrind-X.X.X
-	[me@machine ~/] cd valgrind-X.X.X
-	[me@machine ~/valgrind-X.X.X] ./autogen.sh
-	[me@machine ~/valgrind-X.X.X] ./configure --prefix=`pwd`/inst
-	[me@machine ~/valgrind-X.X.X] make && make install
+		[me@machine ~/] tar jxvf valgrind-X.X.X
+		[me@machine ~/] cd valgrind-X.X.X
+		[me@machine ~/valgrind-X.X.X] ./autogen.sh
+		[me@machine ~/valgrind-X.X.X] ./configure --prefix=`pwd`/inst
+		[me@machine ~/valgrind-X.X.X] make && make install
 
 2. Git clone and build Taintgrind
 
 
-	[me@machine ~/valgrind-X.X.X] git clone http://github.com/CTSRD-SOAAP/taintgrind.git
-	[me@machine ~/valgrind-X.X.X] cd taintgrind 
-	[me@machine ~/valgrind-X.X.X/taintgrind] ../autogen.sh
-	[me@machine ~/valgrind-X.X.X/taintgrind] ./configure --prefix=`pwd`/../inst
-	[me@machine ~/valgrind-X.X.X/taintgrind] make && make install
+		[me@machine ~/valgrind-X.X.X] git clone http://github.com/CTSRD-SOAAP/taintgrind.git
+		[me@machine ~/valgrind-X.X.X] cd taintgrind 
+		[me@machine ~/valgrind-X.X.X/taintgrind] ../autogen.sh
+		[me@machine ~/valgrind-X.X.X/taintgrind] ./configure --prefix=`pwd`/../inst
+		[me@machine ~/valgrind-X.X.X/taintgrind] make && make install
 
 Usage
 -----
