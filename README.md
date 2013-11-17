@@ -8,6 +8,7 @@ Installation
 
 1. Download Valgrind from http://valgrind.org and build
 
+
 	[me@machine ~/] tar jxvf valgrind-X.X.X
 	[me@machine ~/] cd valgrind-X.X.X
 	[me@machine ~/valgrind-X.X.X] ./autogen.sh
@@ -15,6 +16,7 @@ Installation
 	[me@machine ~/valgrind-X.X.X] make && make install
 
 2. Git clone and build Taintgrind
+
 
 	[me@machine ~/valgrind-X.X.X] git clone http://github.com/CTSRD-SOAAP/taintgrind.git
 	[me@machine ~/valgrind-X.X.X] cd taintgrind 
@@ -47,6 +49,8 @@ The output of Taintgrind is a list of Valgrind IR (VEX) statements in the form
 
 
 E.g.
+
+
 	> valgrind --tool=taintgrind --file-filter=/path/to/test.txt --taint-start=0 --taint-len=1 --critical-ins-only=no gzip -c path/to/test.txt
 	==31644== Taintgrind, the taint analysis tool
 	==31644== Copyright (C) 2010, and GNU GPL'd, by Wei Ming Khoo.
@@ -88,7 +92,7 @@ Details of VEX-IDs and VEX-IRStmts can be found in VEX/pub/libvex\_ir.h .
 
 Notes
 -----
-Taintgrind is based on Valgrind's MemCheck and work by Will Drewry on [Flayer](http://code.google.com/p/flayer/).
+Taintgrind is based on [Valgrind](http://valgrind/org)'s MemCheck and work by Will Drewry on [Flayer](http://code.google.com/p/flayer/).
 
 Taintgrind borrows the bit-precise shadow memory from MemCheck and only propagates explicit data flow. This means that Taintgrind will not propagate taint in control structures such as if-else, for-loops and while-loops. Taintgrind will also not propagate taint in dereferenced tainted pointers.
 
